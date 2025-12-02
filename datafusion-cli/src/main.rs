@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, LazyLock};
 
@@ -155,6 +155,13 @@ struct Args {
         default_value_t = InstrumentedObjectStoreMode::Disabled
     )]
     object_store_profiling: InstrumentedObjectStoreMode,
+
+    #[clap(
+        long,
+        help = "Directory path for spilling queries to disk (default: OS temp directory)"
+    )]
+    disk_spill_path: Option<PathBuf>,
+
 }
 
 #[tokio::main]
@@ -210,11 +217,18 @@ async fn main_inner() -> Result<()> {
 
     // set disk limit
     if let Some(disk_limit) = args.disk_limit {
-        let builder = DiskManagerBuilder::default()
-            .with_mode(DiskManagerMode::OsTmpDirectory)
+        let mut builder = DiskManagerBuilder::default()
             .with_max_temp_directory_size(disk_limit.try_into().unwrap());
+
+        builder = if let Some(ref spill_path) = args.disk_spill_path {
+            builder.with_mode(DiskManagerMode::Directories(vec![spill_path.clone()]))
+        } else {
+            builder.with_mode(DiskManagerMode::OsTmpDirectory)
+        };
+
         rt_builder = rt_builder.with_disk_manager_builder(builder);
     }
+
 
     let instrumented_registry = Arc::new(
         InstrumentedObjectStoreRegistry::new()
