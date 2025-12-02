@@ -1248,7 +1248,7 @@ impl ExecutionPlan for SortExec {
                                 break;
                             }
                         }
-                        topk.emit()
+                        topk.emit_final()
                     })
                     .try_flatten(),
                 )))

@@ -19,15 +19,20 @@
 
 use arrow::{
     array::{Array, AsArray},
-    compute::{interleave_record_batch, prep_null_mask_filter, FilterBuilder},
+    compute::{concat_batches, interleave_record_batch, prep_null_mask_filter, FilterBuilder},
     row::{RowConverter, Rows, SortField},
 };
 use datafusion_expr::{ColumnarValue, Operator};
 use std::mem::size_of;
 use std::{cmp::Ordering, collections::BinaryHeap, sync::Arc};
 
-use super::metrics::{BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder};
+use super::metrics::{
+    BaselineMetrics, Count, ExecutionPlanMetricsSet, MetricBuilder, RecordOutput,
+    SpillMetrics,
+};
 use crate::spill::get_record_batch_memory_size;
+use crate::spill::spill_manager::SpillManager;
+use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::{stream::RecordBatchStreamAdapter, SendableRecordBatchStream};
 
 use arrow::array::{ArrayRef, RecordBatch};
@@ -127,6 +132,12 @@ pub struct TopK {
     /// to be greater (by byte order, after row conversion) than the top K,
     /// which means the top K won't change and the computation can be finished early.
     pub(crate) finished: bool,
+    /// Manages spilling to disk
+    spill_manager: SpillManager,
+    /// Spilled heaps
+    finished_spill_files: Vec<SortedSpillFile>,
+    /// Runtime environment
+    runtime: Arc<RuntimeEnv>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,7 +199,9 @@ impl TopK {
         metrics: &ExecutionPlanMetricsSet,
         filter: Arc<RwLock<TopKDynamicFilters>>,
     ) -> Result<Self> {
+        let metrics_struct = TopKMetrics::new(metrics, partition_id);
         let reservation = MemoryConsumer::new(format!("TopK[{partition_id}]"))
+            .with_can_spill(true)
             .register(&runtime.memory_pool);
 
         let sort_fields = build_sort_fields(&expr, &schema)?;
@@ -206,9 +219,15 @@ impl TopK {
             Some(RowConverter::new(input_sort_fields)?)
         };
 
+        let spill_manager = SpillManager::new(
+            Arc::clone(&runtime),
+            metrics_struct.spill_metrics.clone(),
+            Arc::clone(&schema),
+        );
+
         Ok(Self {
             schema: Arc::clone(&schema),
-            metrics: TopKMetrics::new(metrics, partition_id),
+            metrics: metrics_struct,
             reservation,
             batch_size,
             expr,
@@ -219,6 +238,9 @@ impl TopK {
             common_sort_prefix: Arc::from(common_sort_prefix),
             finished: false,
             filter,
+            spill_manager,
+            finished_spill_files: vec![],
+            runtime,
         })
     }
 
@@ -278,6 +300,7 @@ impl TopK {
         rows.clear();
         self.row_converter.append(rows, &sort_keys)?;
 
+        // Register batch first
         let mut batch_entry = self.heap.register_batch(batch.clone());
 
         let replacements = match selected_rows {
@@ -294,9 +317,12 @@ impl TopK {
 
             // conserve memory
             self.heap.maybe_compact()?;
-
-            // update memory reservation
-            self.reservation.try_resize(self.size())?;
+            
+            // Try to update reservation to actual size, spill if needed
+            if self.reservation.try_resize(self.size()).is_err() {
+                self.spill()?;
+                self.reservation.try_resize(self.size())?;
+            }
 
             // flag the topK as finished if we know that all
             // subsequent batches are guaranteed to be greater (by byte order, after row conversion) than the top K,
@@ -575,25 +601,102 @@ impl TopK {
         Ok(())
     }
 
+    /// Spill current heap to disk
+    fn spill(&mut self) -> Result<()> {
+        // Take ownership of the heap to ensure it's fully dropped
+        let k = self.heap.k;
+        let batch_size = self.heap.batch_size;
+        let mut old_heap = std::mem::replace(&mut self.heap, TopKHeap::new(k, batch_size));
+        
+        // Emit from the old heap
+        let batch = old_heap.emit()?;
+        if let Some(batch) = batch {
+            let batch_size_mem = get_record_batch_memory_size(&batch);
+            let spill_file = self
+                .spill_manager
+                .spill_record_batch_and_finish(&[batch], "TopK")?;
+            if let Some(spill_file) = spill_file {
+                self.finished_spill_files.push(SortedSpillFile {
+                    file: spill_file,
+                    max_record_batch_memory: batch_size_mem,
+                });
+            }
+        }
+        
+        // Drop old_heap explicitly to free its memory
+        drop(old_heap);
+        
+        // Free memory reservation - new heap will be sized when next batch is added
+        self.reservation.free();
+        Ok(())
+    }
+
     /// Returns the top k results broken into `batch_size` [`RecordBatch`]es, consuming the heap
-    pub fn emit(self) -> Result<SendableRecordBatchStream> {
+    pub fn emit_final(self) -> Result<SendableRecordBatchStream> {
         let Self {
             schema,
             metrics,
             reservation: _,
             batch_size,
-            expr: _,
+            expr,
             row_converter: _,
             scratch_rows: _,
             mut heap,
             common_sort_prefix_converter: _,
             common_sort_prefix: _,
             finished: _,
-            filter: _,
+            filter,
+            spill_manager,
+            mut finished_spill_files,
+            runtime,
         } = self;
         let _timer = metrics.baseline.elapsed_compute().timer(); // time updated on drop
 
-        // break into record batches as needed
+        // Mark the dynamic filter as complete now that TopK processing is finished.
+        filter.read().expr().mark_complete();
+
+        // If we spilled, merge spilled data with in-memory heap
+        if !finished_spill_files.is_empty() {
+            // Emit current heap as final spill - take ownership to ensure it's dropped
+            let k = heap.k;
+            let batch_size = heap.batch_size;
+            let batch = heap.emit()?;
+            
+            if let Some(batch) = batch {
+                let batch_size_mem = get_record_batch_memory_size(&batch);
+                let spill_file = spill_manager
+                    .spill_record_batch_and_finish(&[batch], "TopK")?;
+                if let Some(spill_file) = spill_file {
+                    finished_spill_files.push(SortedSpillFile {
+                        file: spill_file,
+                        max_record_batch_memory: batch_size_mem,
+                    });
+                }
+            }
+            
+            // Drop heap explicitly to free memory before merge
+            drop(heap);
+
+            // Create a reservation for the merge
+            let merge_reservation = MemoryConsumer::new("TopKMerge")
+                .register(&runtime.memory_pool);
+
+            // Merge all spilled files
+            let merge_stream = StreamingMergeBuilder::new()
+                .with_sorted_spill_files(finished_spill_files)
+                .with_spill_manager(spill_manager)
+                .with_schema(Arc::clone(&schema))
+                .with_expressions(&expr)
+                .with_metrics(metrics.baseline.clone())
+                .with_batch_size(batch_size)
+                .with_fetch(Some(k))
+                .with_reservation(merge_reservation)
+                .build()?;
+
+            return Ok(merge_stream);
+        }
+
+        // No spills, emit in-memory heap
         let mut batches = vec![];
         if let Some(mut batch) = heap.emit()? {
             metrics.baseline.output_rows().add(batch.num_rows());
@@ -630,6 +733,9 @@ struct TopKMetrics {
 
     /// count of how many rows were replaced in the heap
     pub row_replacements: Count,
+
+    /// spill metrics
+    pub spill_metrics: SpillMetrics,
 }
 
 impl TopKMetrics {
@@ -638,6 +744,7 @@ impl TopKMetrics {
             baseline: BaselineMetrics::new(metrics, partition),
             row_replacements: MetricBuilder::new(metrics)
                 .counter("row_replacements", partition),
+            spill_metrics: SpillMetrics::new(metrics, partition),
         }
     }
 }
@@ -1180,7 +1287,7 @@ mod tests {
 
         // Verify the TopK correctly emits the top k rows from both batches
         // (the value 10.0 for b is from the second batch).
-        let results: Vec<_> = topk.emit()?.try_collect().await?;
+        let results: Vec<_> = topk.emit_final()?.try_collect().await?;
         assert_batches_eq!(
             &[
                 "+---+------+",
@@ -1193,6 +1300,138 @@ mod tests {
             ],
             &results
         );
+
+        Ok(())
+    }
+
+    /// This test verifies that the dynamic filter is marked as complete after TopK processing finishes.
+    #[tokio::test]
+    async fn test_topk_marks_filter_complete() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        let sort_expr = PhysicalSortExpr {
+            expr: col("a", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+
+        let full_expr = LexOrdering::from([sort_expr.clone()]);
+        let prefix = vec![sort_expr];
+
+        // Create a dummy runtime environment and metrics
+        let runtime = Arc::new(RuntimeEnv::default());
+        let metrics = ExecutionPlanMetricsSet::new();
+
+        // Create a dynamic filter that we'll check for completion
+        let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(vec![], lit(true)));
+        let dynamic_filter_clone = Arc::clone(&dynamic_filter);
+
+        // Create a TopK instance
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            prefix,
+            full_expr,
+            2,
+            10,
+            runtime,
+            &metrics,
+            Arc::new(RwLock::new(TopKDynamicFilters::new(dynamic_filter))),
+        )?;
+
+        let array: ArrayRef = Arc::new(Int32Array::from(vec![Some(3), Some(1), Some(2)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array])?;
+        topk.insert_batch(batch)?;
+
+        // Call emit to finish TopK processing
+        let _results: Vec<_> = topk.emit_final()?.try_collect().await?;
+
+        // After emit is called, the dynamic filter should be marked as complete
+        // wait_complete() should return immediately
+        dynamic_filter_clone.wait_complete().await;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_topk_spill() -> Result<()> {
+        use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+        
+        // Create a schema with one column
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        let sort_expr = PhysicalSortExpr {
+            expr: col("a", schema.as_ref())?,
+            options: SortOptions::default(),
+        };
+
+        // Create a runtime with very limited memory to force spilling
+        // With k=100 and many batches, we should exceed 4KB and trigger spilling
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_limit(4096, 1.0)
+            .build_arc()?;
+        
+        let metrics = ExecutionPlanMetricsSet::new();
+
+        let mut topk = TopK::try_new(
+            0,
+            Arc::clone(&schema),
+            vec![],
+            LexOrdering::from([sort_expr]),
+            100, // Keep top 100 to increase memory usage
+            2,
+            Arc::clone(&runtime),
+            &metrics,
+            Arc::new(RwLock::new(TopKDynamicFilters::new(Arc::new(
+                DynamicFilterPhysicalExpr::new(vec![], lit(true)),
+            )))),
+        )?;
+
+        // Insert many batches to trigger spilling
+        for i in 0..100 {
+            let array: ArrayRef = Arc::new(Int32Array::from(vec![
+                Some(i * 10 + 1),
+                Some(i * 10 + 2),
+                Some(i * 10 + 3),
+                Some(i * 10 + 4),
+                Some(i * 10 + 5),
+                Some(i * 10 + 6),
+                Some(i * 10 + 7),
+                Some(i * 10 + 8),
+                Some(i * 10 + 9),
+                Some(i * 10 + 10),
+            ]));
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array])?;
+            topk.insert_batch(batch)?;
+        }
+
+        // Check spilling occurred
+        let spill_count = topk.metrics.spill_metrics.spill_file_count.value();
+        let spilled_bytes = topk.metrics.spill_metrics.spilled_bytes.value();
+        
+        println!("TopK spilled {} times, {} bytes", spill_count, spilled_bytes);
+        
+        // Emit results
+        let results: Vec<_> = topk.emit_final()?.try_collect().await?;
+        
+        // Verify we got the top 100 smallest values
+        let result_batch = concat_batches(&schema, &results)?;
+        assert_eq!(result_batch.num_rows(), 100);
+        
+        let values = result_batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        
+        // Verify first few values
+        assert_eq!(values.value(0), 1);
+        assert_eq!(values.value(1), 2);
+        assert_eq!(values.value(2), 3);
+        assert_eq!(values.value(99), 100);
+
+        // Verify spilling actually happened
+        assert!(spill_count > 0, "Expected spilling to occur but spill_count = {}", spill_count);
+        assert!(spilled_bytes > 0, "Expected bytes to be spilled but spilled_bytes = {}", spilled_bytes);
 
         Ok(())
     }
