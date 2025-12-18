@@ -1097,7 +1097,9 @@ impl RecordBatchStore {
     pub fn insert(&mut self, entry: RecordBatchEntry) {
         // uses of 0 means that none of the rows in the batch were stored in the topk
         if entry.uses > 0 {
-            self.batches_size += get_record_batch_memory_size(&entry.batch);
+            let size = get_record_batch_memory_size(&entry.batch);
+            self.batches_size += size;
+            println!("size during insert : {}", size);
             self.batches.insert(entry.id, entry);
         }
     }
@@ -1145,9 +1147,11 @@ impl RecordBatchStore {
 
         if remove {
             let old_entry = self.batches.remove(&id).unwrap();
+            let size = get_record_batch_memory_size(&old_entry.batch);
+            println!("Remove size : {}", size);
             self.batches_size = self
                 .batches_size
-                .checked_sub(get_record_batch_memory_size(&old_entry.batch))
+                .checked_sub(size)
                 .unwrap();
         }
     }
@@ -1155,9 +1159,16 @@ impl RecordBatchStore {
     /// returns the size of memory used by this store, including all
     /// referenced `RecordBatch`es, in bytes
     pub fn size(&self) -> usize {
-        size_of::<Self>()
-            + self.batches.capacity() * (size_of::<u32>() + size_of::<RecordBatchEntry>())
-            + self.batches_size
+        let sizeOfSelf = size_of::<Self>();
+        let capacity = self.batches.capacity();
+        let u32RecordBatch = size_of::<u32>() + size_of::<RecordBatchEntry>();
+        let batchesSize = self.batches_size;
+
+        let size = sizeOfSelf + capacity * u32RecordBatch + batchesSize;
+        println!("self size : {} , capacity : {} , record batch : {}, batches size : {}",
+                    sizeOfSelf, capacity, u32RecordBatch, batchesSize);
+        println!("size during get : {}", size);
+        size
     }
 }
 
