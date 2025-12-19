@@ -14,23 +14,19 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 //! Define the `SpillManager` struct, which is responsible for reading and writing `RecordBatch`es to raw files based on the provided configurations.
-
-use arrow::array::StringViewArray;
+use arrow::array::{ArrayRef, BinaryViewArray, StringViewArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_execution::runtime_env::RuntimeEnv;
 use std::sync::Arc;
-
+use log::debug;
 use datafusion_common::{Result, config::SpillCompression};
 use datafusion_execution::SendableRecordBatchStream;
 use datafusion_execution::disk_manager::RefCountedTempFile;
-
 use super::{SpillReaderStream, in_progress_spill_file::InProgressSpillFile};
 use crate::coop::cooperative;
 use crate::{common::spawn_buffered, metrics::SpillMetrics};
-
 /// The `SpillManager` is responsible for the following tasks:
 /// - Reading and writing `RecordBatch`es to raw files based on the provided configurations.
 /// - Updating the associated metrics.
@@ -47,7 +43,42 @@ pub struct SpillManager {
     /// general-purpose compression options
     pub(crate) compression: SpillCompression,
 }
-
+fn format_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * KB;
+    const GB: usize = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+/// GC StringViewArray/BinaryViewArray to compact data buffers.
+/// Sliced view arrays still reference original large buffers; gc() creates compact copies.
+fn gc_view_arrays(batch: &RecordBatch) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut any_gc = false;
+    for col in batch.columns() {
+        if let Some(sv) = col.as_any().downcast_ref::<StringViewArray>() {
+            columns.push(Arc::new(sv.gc()));
+            any_gc = true;
+        } else if let Some(bv) = col.as_any().downcast_ref::<BinaryViewArray>() {
+            columns.push(Arc::new(bv.gc()));
+            any_gc = true;
+        } else {
+            columns.push(Arc::clone(col));
+        }
+    }
+    if any_gc {
+        RecordBatch::try_new(batch.schema(), columns).map_err(Into::into)
+    } else {
+        Ok(batch.clone())
+    }
+}
 impl SpillManager {
     pub fn new(env: Arc<RuntimeEnv>, metrics: SpillMetrics, schema: SchemaRef) -> Self {
         Self {
@@ -85,6 +116,10 @@ impl SpillManager {
         request_msg: &str,
     ) -> Result<InProgressSpillFile> {
         let temp_file = self.env.disk_manager.create_tmp_file(request_msg)?;
+        debug!(
+            "[SPILL_MANAGER] Created temp file: {:?}",
+            temp_file.path()
+        );
         Ok(InProgressSpillFile::new(Arc::new(self.clone()), temp_file))
     }
 
@@ -123,27 +158,40 @@ impl SpillManager {
         row_limit: usize,
     ) -> Result<Option<(RefCountedTempFile, usize)>> {
         let total_rows = batch.num_rows();
-        let mut batches = Vec::new();
+        let mut in_progress_file = self.create_in_progress_file(request_description)?;
+        let mut max_record_batch_size = 0;
+        let mut total_written = 0usize;
         let mut offset = 0;
+        let mut batch_idx = 0;
 
-        // It's ok to calculate all slices first, because slicing is zero-copy.
         while offset < total_rows {
             let length = std::cmp::min(total_rows - offset, row_limit);
-            let sliced_batch = batch.slice(offset, length);
-            batches.push(sliced_batch);
+            let sliced = batch.slice(offset, length);
+
+            // Compare before/after gc
+            let before_size = sliced.get_array_memory_size();
+            let compacted = gc_view_arrays(&sliced)?;
+            let after_size = compacted.get_array_memory_size();
+
+            debug!(
+                "[SPILL_MANAGER] Batch {}: before_gc={}, after_gc={}, saved={}",
+                batch_idx,
+                format_bytes(before_size),
+                format_bytes(after_size),
+                format_bytes(before_size.saturating_sub(after_size))
+            );
+            in_progress_file.append_batch(&compacted)?;
+            batch_idx += 1;
+            max_record_batch_size = max_record_batch_size.max(after_size);
+            total_written += after_size;
             offset += length;
         }
-
-        let mut in_progress_file = self.create_in_progress_file(request_description)?;
-
-        let mut max_record_batch_size = 0;
-
-        for batch in batches {
-            in_progress_file.append_batch(&batch)?;
-
-            max_record_batch_size = max_record_batch_size.max(batch.get_sliced_size()?);
-        }
-
+        debug!(
+            "[SPILL_MANAGER] Total: {} batches, total_written={}, max_record={}",
+            batch_idx,
+            format_bytes(total_written),
+            format_bytes(max_record_batch_size)
+        );
         let file = in_progress_file.finish()?;
 
         Ok(file.map(|f| (f, max_record_batch_size)))
@@ -172,7 +220,6 @@ impl SpillManager {
 
         Ok(file.map(|f| (f, max_record_batch_size)))
     }
-
     /// Reads a spill file as a stream. The file must be created by the current `SpillManager`.
     /// This method will generate output in FIFO order: the batch appended first
     /// will be read first.
