@@ -54,6 +54,45 @@ use futures::ready;
 use futures::stream::{Stream, StreamExt};
 use log::debug;
 
+/// Helper to format bytes as human-readable
+fn format_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * KB;
+    const GB: usize = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// GC StringViewArrays in a batch to compact data buffers before spilling
+/// GC StringViewArray/BinaryViewArray in a batch to compact data buffers before spilling
+fn gc_string_view_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut any_gc = false;
+    for col in batch.columns() {
+        if let Some(sv) = col.as_any().downcast_ref::<StringViewArray>() {
+            columns.push(Arc::new(sv.gc()));
+            any_gc = true;
+        } else if let Some(bv) = col.as_any().downcast_ref::<BinaryViewArray>() {
+            columns.push(Arc::new(bv.gc()));
+            any_gc = true;
+        } else {
+            columns.push(Arc::clone(col));
+        }
+    }
+    if any_gc {
+        RecordBatch::try_new(batch.schema(), columns).map_err(Into::into)
+    } else {
+        Ok(batch.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 /// This object tracks the aggregation phase (input/output)
 pub(crate) enum ExecutionState {
@@ -852,6 +891,9 @@ impl RecordBatchStream for GroupedHashAggregateStream {
 impl GroupedHashAggregateStream {
     /// Perform group-by aggregation for the given [`RecordBatch`].
     fn group_aggregate_batch(&mut self, batch: RecordBatch) -> Result<()> {
+        let batch_rows = batch.num_rows();
+        let groups_before = self.group_values.len();
+
         // Evaluate the grouping expressions
         let group_by_values = if self.spill_state.is_stream_merging {
             evaluate_group_by(&self.spill_state.merging_group_by, &batch)?
@@ -953,12 +995,19 @@ impl GroupedHashAggregateStream {
             }
         }
 
+        let groups_after = self.group_values.len();
+        let _new_groups = groups_after - groups_before;
+
         match self.update_memory_reservation() {
             // Here we can ignore `insufficient_capacity_err` because we will spill later,
             // but at least one batch should fit in the memory
-            Err(DataFusionError::ResourcesExhausted(_))
+            Err(DataFusionError::ResourcesExhausted(ref msg))
                 if self.group_values.len() >= self.batch_size =>
             {
+                debug!(
+                    "[MEMORY_EXHAUSTED] Will spill soon: {}, num_groups={}",
+                    msg, self.group_values.len()
+                );
                 Ok(())
             }
             other => other,
@@ -966,12 +1015,13 @@ impl GroupedHashAggregateStream {
     }
 
     fn update_memory_reservation(&mut self) -> Result<()> {
-        let acc = self.accumulators.iter().map(|x| x.size()).sum::<usize>();
-        let reservation_result = self.reservation.try_resize(
-            acc + self.group_values.size()
-                + self.group_ordering.size()
-                + self.current_group_indices.allocated_size(),
-        );
+        let acc_size = self.accumulators.iter().map(|x| x.size()).sum::<usize>();
+        let group_values_size = self.group_values.size();
+        let group_ordering_size = self.group_ordering.size();
+        let indices_size = self.current_group_indices.allocated_size();
+        let total_size = acc_size + group_values_size + group_ordering_size + indices_size;
+        
+        let reservation_result = self.reservation.try_resize(total_size);
 
         if reservation_result.is_ok() {
             self.spill_state
@@ -1031,13 +1081,23 @@ impl GroupedHashAggregateStream {
     /// memory. Currently only [`GroupOrdering::None`] is supported for spilling.
     fn spill_previous_if_necessary(&mut self, batch: &RecordBatch) -> Result<()> {
         // TODO: support group_ordering for spilling
-        if !self.group_values.is_empty()
+        let mem_check = self.update_memory_reservation();
+        let should_spill = !self.group_values.is_empty()
             && batch.num_rows() > 0
             && matches!(self.group_ordering, GroupOrdering::None)
             && !self.spill_state.is_stream_merging
-            && self.update_memory_reservation().is_err()
-        {
+            && mem_check.is_err();
+
+        if should_spill {
             assert_ne!(self.mode, AggregateMode::Partial);
+            debug!(
+                "[SPILL_TRIGGER] Spilling: num_groups={}, num_existing_spills={}, \
+                 reservation={}, is_stream_merging={}",
+                self.group_values.len(),
+                self.spill_state.spills.len(),
+                format_bytes(self.reservation.size()),
+                self.spill_state.is_stream_merging
+            );
             self.spill()?;
             self.clear_shrink(batch);
         }
@@ -1048,11 +1108,41 @@ impl GroupedHashAggregateStream {
     /// This process helps in reducing memory pressure by allowing the data to be
     /// read back with streaming merge.
     fn spill(&mut self) -> Result<()> {
+        let num_groups = self.group_values.len();
+        let acc_size: usize = self.accumulators.iter().map(|x| x.size()).sum();
+        
+        debug!(
+            "[SPILL] Starting: num_groups={}, acc_size={}, group_values_size={}, \
+             existing_spills={}, is_stream_merging={}",
+            num_groups,
+            format_bytes(acc_size),
+            format_bytes(self.group_values.size()),
+            self.spill_state.spills.len(),
+            self.spill_state.is_stream_merging
+        );
+
         // Emit and sort intermediate aggregation state
         let Some(emit) = self.emit(EmitTo::All, true)? else {
+            debug!("[SPILL] No data to emit");
             return Ok(());
         };
+
+        debug!(
+            "[SPILL] Emitted: rows={}, memory_size={}",
+            emit.num_rows(),
+            format_bytes(emit.get_array_memory_size())
+        );
+
         let sorted = sort_batch(&emit, &self.spill_state.spill_expr, None)?;
+
+        // GC StringViewArrays to avoid writing unreferenced data buffers to spill file
+        let sorted = gc_string_view_batch(&sorted)?;
+
+        debug!(
+            "[SPILL] Sorted: rows={}, memory_size={}",
+            sorted.num_rows(),
+            format_bytes(sorted.get_array_memory_size())
+        );
 
         // Spill sorted state to disk
         let spillfile = self
@@ -1065,6 +1155,11 @@ impl GroupedHashAggregateStream {
             )?;
         match spillfile {
             Some((spillfile, max_record_batch_memory)) => {
+                debug!(
+                    "[SPILL] Complete: file={:?}, total_spills={}",
+                    spillfile.path(),
+                    self.spill_state.spills.len() + 1
+                );
                 self.spill_state.spills.push(SortedSpillFile {
                     file: spillfile,
                     max_record_batch_memory,
@@ -1097,12 +1192,18 @@ impl GroupedHashAggregateStream {
     /// Currently only [`GroupOrdering::None`] is supported for early emitting.
     /// TODO: support group_ordering for early emitting
     fn emit_early_if_necessary(&mut self) -> Result<()> {
-        if self.group_values.len() >= self.batch_size
+        let should_emit = self.group_values.len() >= self.batch_size
             && matches!(self.group_ordering, GroupOrdering::None)
-            && self.update_memory_reservation().is_err()
-        {
+            && self.update_memory_reservation().is_err();
+
+        if should_emit {
             assert_eq!(self.mode, AggregateMode::Partial);
             let n = self.group_values.len() / self.batch_size * self.batch_size;
+            debug!(
+                "[EARLY_EMIT] Partial agg emitting: num_groups={}, emitting_first={}",
+                self.group_values.len(),
+                n
+            );
             if let Some(batch) = self.emit(EmitTo::First(n), false)? {
                 self.exec_state = ExecutionState::ProducingOutput(batch);
             };
@@ -1115,12 +1216,20 @@ impl GroupedHashAggregateStream {
     /// Conduct a streaming merge sort between the batch and spilled data. Since the stream is fully
     /// sorted, set `self.group_ordering` to Full, then later we can read with [`EmitTo::First`].
     fn update_merged_stream(&mut self) -> Result<()> {
+        debug!(
+            "[MERGE] Starting: num_spills={}, num_groups_in_memory={}",
+            self.spill_state.spills.len(),
+            self.group_values.len()
+        );
+
         let Some(batch) = self.emit(EmitTo::All, true)? else {
             return Ok(());
         };
+
         // clear up memory for streaming_merge
         self.clear_all();
         self.update_memory_reservation()?;
+
         let mut streams: Vec<SendableRecordBatchStream> = vec![];
         let expr = self.spill_state.spill_expr.clone();
         let schema = batch.schema();
@@ -1132,6 +1241,7 @@ impl GroupedHashAggregateStream {
         )));
 
         self.spill_state.is_stream_merging = true;
+
         self.input = StreamingMergeBuilder::new()
             .with_streams(streams)
             .with_schema(schema)
@@ -1144,6 +1254,8 @@ impl GroupedHashAggregateStream {
             .build()?;
         self.input_done = false;
         self.group_ordering = GroupOrdering::Full(GroupOrderingFull::new());
+        
+        debug!("[MERGE] Stream merge setup complete");
         Ok(())
     }
 
@@ -1167,6 +1279,11 @@ impl GroupedHashAggregateStream {
             batch.map_or(ExecutionState::Done, ExecutionState::ProducingOutput)
         } else {
             // If spill files exist, stream-merge them.
+            debug!(
+                "[INPUT_DONE] Starting merge of {} spill files, num_groups={}",
+                self.spill_state.spills.len(),
+                self.group_values.len()
+            );
             self.update_merged_stream()?;
             ExecutionState::ReadingInput
         };

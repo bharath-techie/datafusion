@@ -34,6 +34,7 @@ use datafusion_execution::memory_pool::{
     UnboundedMemoryPool,
 };
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
+use log::debug;
 use std::sync::Arc;
 
 macro_rules! primitive_merge_helper {
@@ -188,7 +189,27 @@ impl<'a> StreamingMergeBuilder<'a> {
             return internal_err!("Sort expressions cannot be empty for streaming merge");
         };
 
+        debug!(
+            "[STREAMING_MERGE] build: num_streams={}, num_spill_files={}, batch_size={:?}, fetch={:?}",
+            streams.len(),
+            sorted_spill_files.len(),
+            batch_size,
+            fetch
+        );
+
         if !sorted_spill_files.is_empty() {
+            let total_spill_memory: usize = sorted_spill_files
+                .iter()
+                .map(|s| s.max_record_batch_memory)
+                .sum();
+            
+            debug!(
+                "[STREAMING_MERGE] Using MultiLevelMergeBuilder: {} spill files, \
+                 total_max_batch_memory={}",
+                sorted_spill_files.len(),
+                human_readable_size(total_spill_memory)
+            );
+
             // Unwrapping mandatory fields
             let schema = schema.expect("Schema cannot be empty for streaming merge");
             let metrics = metrics.expect("Metrics cannot be empty for streaming merge");

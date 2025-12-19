@@ -17,10 +17,11 @@
 
 //! Define the `SpillManager` struct, which is responsible for reading and writing `RecordBatch`es to raw files based on the provided configurations.
 
-use arrow::array::StringViewArray;
+use arrow::array::{Array, ArrayRef, BinaryViewArray, StringViewArray};
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_execution::runtime_env::RuntimeEnv;
+use log::debug;
 use std::sync::Arc;
 
 use datafusion_common::{config::SpillCompression, Result};
@@ -30,6 +31,45 @@ use datafusion_execution::SendableRecordBatchStream;
 use super::{in_progress_spill_file::InProgressSpillFile, SpillReaderStream};
 use crate::coop::cooperative;
 use crate::{common::spawn_buffered, metrics::SpillMetrics};
+
+/// Helper to format bytes as human-readable
+fn format_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * KB;
+    const GB: usize = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+/// GC StringViewArray/BinaryViewArray to compact data buffers before spilling.
+/// Sliced view arrays still reference original large buffers; gc() creates compact copies.
+fn gc_view_arrays(batch: &RecordBatch) -> Result<RecordBatch> {
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    let mut any_gc = false;
+    for col in batch.columns() {
+        if let Some(sv) = col.as_any().downcast_ref::<StringViewArray>() {
+            columns.push(Arc::new(sv.gc()));
+            any_gc = true;
+        } else if let Some(bv) = col.as_any().downcast_ref::<BinaryViewArray>() {
+            columns.push(Arc::new(bv.gc()));
+            any_gc = true;
+        } else {
+            columns.push(Arc::clone(col));
+        }
+    }
+    if any_gc {
+        RecordBatch::try_new(batch.schema(), columns).map_err(Into::into)
+    } else {
+        Ok(batch.clone())
+    }
+}
 
 /// The `SpillManager` is responsible for the following tasks:
 /// - Reading and writing `RecordBatch`es to raw files based on the provided configurations.
@@ -85,6 +125,10 @@ impl SpillManager {
         request_msg: &str,
     ) -> Result<InProgressSpillFile> {
         let temp_file = self.env.disk_manager.create_tmp_file(request_msg)?;
+        debug!(
+            "[SPILL_MANAGER] Created temp file: {:?}",
+            temp_file.path()
+        );
         Ok(InProgressSpillFile::new(Arc::new(self.clone()), temp_file))
     }
 
@@ -116,6 +160,66 @@ impl SpillManager {
     /// # Errors
     /// - Returns an error if spilling would exceed the disk usage limit configured
     ///   by `max_temp_directory_size` in `DiskManager`
+    // pub(crate) fn spill_record_batch_by_size_and_return_max_batch_memory(
+    //     &self,
+    //     batch: &RecordBatch,
+    //     request_description: &str,
+    //     row_limit: usize,
+    // ) -> Result<Option<(RefCountedTempFile, usize)>> {
+    //     let total_rows = batch.num_rows();
+    //     let batch_memory = batch.get_array_memory_size();
+    //
+    //     debug!(
+    //         "[SPILL_MANAGER] Writing {} rows ({}) to disk with row_limit={}",
+    //         total_rows,
+    //         format_bytes(batch_memory),
+    //         row_limit
+    //     );
+    //
+    //     let mut in_progress_file = self.create_in_progress_file(request_description)?;
+    //
+    //     let mut max_record_batch_size = 0;
+    //     let mut total_written = 0usize;
+    //     let mut offset = 0;
+    //     let mut batch_idx = 0;
+    //     let num_batches = (total_rows + row_limit - 1) / row_limit;
+    //
+    //     while offset < total_rows {
+    //         let length = std::cmp::min(total_rows - offset, row_limit);
+    //         let sliced = batch.slice(offset, length);
+    //         // GC view arrays to compact buffers - slices reference original large buffers
+    //         let compacted = gc_view_arrays(&sliced)?;
+    //
+    //         in_progress_file.append_batch(&compacted)?;
+    //         let batch_size = compacted.get_array_memory_size();
+    //         max_record_batch_size = max_record_batch_size.max(batch_size);
+    //         total_written += batch_size;
+    //
+    //         batch_idx += 1;
+    //         if batch_idx % 500 == 0 || batch_idx == num_batches {
+    //             debug!(
+    //                 "[SPILL_MANAGER] Progress: {}/{} batches, total_written={}",
+    //                 batch_idx,
+    //                 num_batches,
+    //                 format_bytes(total_written)
+    //             );
+    //         }
+    //         offset += length;
+    //     }
+    //
+    //     let file = in_progress_file.finish()?;
+    //
+    //     if let Some(ref f) = file {
+    //         debug!(
+    //             "[SPILL_MANAGER] Finished writing to {:?}, total_written={}",
+    //             f.path(),
+    //             format_bytes(total_written)
+    //         );
+    //     }
+    //
+    //     Ok(file.map(|f| (f, max_record_batch_size)))
+    // }
+
     pub(crate) fn spill_record_batch_by_size_and_return_max_batch_memory(
         &self,
         batch: &RecordBatch,
@@ -138,16 +242,34 @@ impl SpillManager {
 
         let mut max_record_batch_size = 0;
 
+            let mut max_record_batch_size = 0;
+            let mut total_written = 0usize;
+            let mut offset = 0;
+            let mut batch_idx = 0;
+            let num_batches = (total_rows + row_limit - 1) / row_limit;
+
+
         for batch in batches {
             in_progress_file.append_batch(&batch)?;
 
             max_record_batch_size = max_record_batch_size.max(batch.get_sliced_size()?);
+            let batch_size = batch.get_sliced_size()?;
+
+            total_written += batch_size;
+            debug!(
+                "[SPILL_MANAGER] Progress: {}/{} batches, total_written={}",
+                batch_idx,
+                num_batches,
+                format_bytes(total_written)
+            );
+
         }
 
         let file = in_progress_file.finish()?;
 
         Ok(file.map(|f| (f, max_record_batch_size)))
     }
+
 
     /// Spill a stream of `RecordBatch`es to disk and return the spill file and the size of the largest batch in memory
     pub(crate) async fn spill_record_batch_stream_and_return_max_batch_memory(
@@ -157,18 +279,52 @@ impl SpillManager {
     ) -> Result<Option<(RefCountedTempFile, usize)>> {
         use futures::StreamExt;
 
+        debug!(
+            "[SPILL_MANAGER] Starting stream spill: {}",
+            request_description
+        );
+
         let mut in_progress_file = self.create_in_progress_file(request_description)?;
 
         let mut max_record_batch_size = 0;
+        let mut batch_count = 0usize;
+        let mut total_rows = 0usize;
+        let mut total_size = 0usize;
 
         while let Some(batch) = stream.next().await {
             let batch = batch?;
+            let batch_rows = batch.num_rows();
+            let batch_size = batch.get_sliced_size()?;
+            
             in_progress_file.append_batch(&batch)?;
 
-            max_record_batch_size = max_record_batch_size.max(batch.get_sliced_size()?);
+            max_record_batch_size = max_record_batch_size.max(batch_size);
+            batch_count += 1;
+            total_rows += batch_rows;
+            total_size += batch_size;
+
+            // Log progress every 500 batches
+            if batch_count % 500 == 0 {
+                debug!(
+                    "[SPILL_MANAGER] Stream spill progress: {} batches, {} rows, {}",
+                    batch_count,
+                    total_rows,
+                    format_bytes(total_size)
+                );
+            }
         }
 
         let file = in_progress_file.finish()?;
+
+        if let Some(ref f) = file {
+            debug!(
+                "[SPILL_MANAGER] Stream spill complete: {} batches, {} rows, {}, file={:?}",
+                batch_count,
+                total_rows,
+                format_bytes(total_size),
+                f.path()
+            );
+        }
 
         Ok(file.map(|f| (f, max_record_batch_size)))
     }
@@ -205,9 +361,10 @@ impl GetSlicedSize for RecordBatch {
             let data = array.to_data();
             total += data.get_slice_memory_size()?;
 
-            // While StringViewArray holds large data buffer for non inlined string, the Arrow layout (BufferSpec)
-            // does not include any data buffers. Currently, ArrayData::get_slice_memory_size()
-            // under-counts memory size by accounting only views buffer although data buffer is cloned during slice()
+            // While StringViewArray/BinaryViewArray holds large data buffer for non inlined values,
+            // the Arrow layout (BufferSpec) does not include any data buffers.
+            // Currently, ArrayData::get_slice_memory_size() under-counts memory size by accounting
+            // only views buffer although data buffer is cloned during slice()
             //
             // Therefore, we manually add the sum of the lengths used by all non inlined views
             // on top of the sliced size for views buffer. This matches the intended semantics of
@@ -215,6 +372,10 @@ impl GetSlicedSize for RecordBatch {
             // This is a workaround until https://github.com/apache/arrow-rs/issues/8230
             if let Some(sv) = array.as_any().downcast_ref::<StringViewArray>() {
                 for buffer in sv.data_buffers() {
+                    total += buffer.capacity();
+                }
+            } else if let Some(bv) = array.as_any().downcast_ref::<BinaryViewArray>() {
+                for buffer in bv.data_buffers() {
                     total += buffer.capacity();
                 }
             }

@@ -18,6 +18,7 @@
 //! Define the `InProgressSpillFile` struct, which represents an in-progress spill file used for writing `RecordBatch`es to disk, created by `SpillManager`.
 
 use datafusion_common::Result;
+use log::debug;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
@@ -25,6 +26,22 @@ use datafusion_common::exec_datafusion_err;
 use datafusion_execution::disk_manager::RefCountedTempFile;
 
 use super::{spill_manager::SpillManager, IPCStreamWriter};
+
+/// Helper to format bytes as human-readable
+fn format_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * KB;
+    const GB: usize = 1024 * MB;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
 
 /// Represents an in-progress spill file used for writing `RecordBatch`es to disk, created by `SpillManager`.
 /// Caller is able to use this struct to incrementally append in-memory batches to
@@ -109,6 +126,15 @@ impl InProgressSpillFile {
             in_progress_file.update_disk_usage()?;
             let size = in_progress_file.current_disk_usage();
             self.spill_writer.metrics.spilled_bytes.add(size as usize);
+            
+            debug!(
+                "[SPILL_FILE] Finished spill file: path={:?}, size={}, \
+                 total_spilled_bytes={}, total_spill_files={}",
+                in_progress_file.path(),
+                format_bytes(size as usize),
+                format_bytes(self.spill_writer.metrics.spilled_bytes.value()),
+                self.spill_writer.metrics.spill_file_count.value()
+            );
         }
 
         Ok(self.in_progress_file.take())

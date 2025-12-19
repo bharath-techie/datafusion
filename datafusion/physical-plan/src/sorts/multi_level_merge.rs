@@ -20,6 +20,7 @@
 use crate::metrics::BaselineMetrics;
 use crate::{EmptyRecordBatchStream, SpillManager};
 use arrow::array::RecordBatch;
+use log::debug;
 use std::fmt::{Debug, Formatter};
 use std::mem;
 use std::pin::Pin;
@@ -28,7 +29,7 @@ use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use datafusion_common::Result;
-use datafusion_execution::memory_pool::MemoryReservation;
+use datafusion_execution::memory_pool::{human_readable_size, MemoryReservation};
 
 use crate::sorts::sort::get_reserved_byte_for_record_batch_size;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
@@ -180,22 +181,47 @@ impl MultiLevelMergeBuilder {
     }
 
     async fn create_stream(mut self) -> Result<SendableRecordBatchStream> {
+        let mut iteration = 0;
         loop {
+            iteration += 1;
+            
+            let total_spill_size: usize = self.sorted_spill_files
+                .iter()
+                .map(|s| s.max_record_batch_memory)
+                .sum();
+            
+            debug!(
+                "[MULTI_LEVEL_MERGE] Iteration {}: spill_files={}, streams={}, \
+                 total_spill_max_batch_mem={}, reservation={}",
+                iteration,
+                self.sorted_spill_files.len(),
+                self.sorted_streams.len(),
+                human_readable_size(total_spill_size),
+                human_readable_size(self.reservation.size())
+            );
+
             let mut stream = self.merge_sorted_runs_within_mem_limit()?;
 
-            // TODO - add a threshold for number of files to disk even if empty and reading from disk so
-            //        we can avoid the memory reservation
-
             // If no spill files are left, we can return the stream as this is the last sorted run
-            // TODO - We can write to disk before reading it back to avoid having multiple streams in memory
             if self.sorted_spill_files.is_empty() {
                 assert!(
                     self.sorted_streams.is_empty(),
                     "We should not have any sorted streams left"
                 );
 
+                debug!(
+                    "[MULTI_LEVEL_MERGE] Final iteration {}: returning merged stream",
+                    iteration
+                );
                 return Ok(stream);
             }
+
+            debug!(
+                "[MULTI_LEVEL_MERGE] Iteration {}: need intermediate spill, \
+                 remaining_spill_files={}",
+                iteration,
+                self.sorted_spill_files.len()
+            );
 
             // Need to sort to a spill file
             let Some((spill_file, max_record_batch_memory)) = self
@@ -206,8 +232,20 @@ impl MultiLevelMergeBuilder {
                 )
                 .await?
             else {
+                debug!(
+                    "[MULTI_LEVEL_MERGE] Iteration {}: no data spilled",
+                    iteration
+                );
                 continue;
             };
+
+            debug!(
+                "[MULTI_LEVEL_MERGE] Iteration {}: created intermediate spill, \
+                 max_batch_memory={}, file={:?}",
+                iteration,
+                human_readable_size(max_record_batch_memory),
+                spill_file.path()
+            );
 
             // Add the spill file
             self.sorted_spill_files.push(SortedSpillFile {
