@@ -22,6 +22,25 @@ use std::task::Waker;
 
 use parking_lot::Mutex;
 
+#[cfg(test)]
+type SpillPoolAfterSelectWriteFileHook = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[cfg(test)]
+static SPILL_POOL_AFTER_SELECT_WRITE_FILE_HOOK: std::sync::Mutex<
+    Option<SpillPoolAfterSelectWriteFileHook>,
+> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn run_spill_pool_after_select_write_file_hook() {
+    let hook = SPILL_POOL_AFTER_SELECT_WRITE_FILE_HOOK
+        .lock()
+        .expect("spill pool hook mutex poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
@@ -201,6 +220,8 @@ impl SpillPoolWriter {
         // Release shared lock before file I/O (fine-grained locking)
         // This allows readers to access the queue while we do disk I/O
         drop(shared);
+        #[cfg(test)]
+        run_spill_pool_after_select_write_file_hook();
 
         // Write batch to current file - lock only the specific file
         if let Some(current_file) = current_write_file {
@@ -216,7 +237,7 @@ impl SpillPoolWriter {
                 file_shared.estimated_size += batch_size;
             }
 
-            // Wake reader waiting on this specific file
+            // Wake a reader waiting directly on this specific file.
             file_shared.wake();
 
             // Check if we need to rotate
@@ -232,13 +253,44 @@ impl SpillPoolWriter {
                 // Wake reader waiting on this file (it's now finished)
                 file_shared.wake();
                 // Don't put back current_write_file - let it rotate
-            } else {
-                // Release file lock
-                drop(file_shared);
-                // Put back the current file for further writing
-                let mut shared = self.shared.lock();
-                shared.current_write_file = Some(current_file);
             }
+
+            // Release the file lock before touching pool state (lock ordering).
+            drop(file_shared);
+
+            // Every append/finish is also a pool-level state change. The single
+            // reader can be parked either inside `SpillFile` (per-file waker) or
+            // in `SpillPoolReader` (pool waker), depending on exactly which
+            // layer observed `Pending`. Wake the pool-level slot for all writer
+            // progress so a reader is not stranded on the other coordination
+            // slot.
+            let mut shared = self.shared.lock();
+            if !needs_rotation {
+                if shared.current_write_file.is_none() {
+                    // Put back the current file for further writing.
+                    shared.current_write_file = Some(current_file);
+                } else {
+                    // Another writer observed the temporary `None` while this
+                    // writer was doing file I/O and installed a different current
+                    // file. Do not overwrite it: that would orphan the other
+                    // file in the FIFO queue. Seal this file instead so the
+                    // reader can advance to the file that won the current slot.
+                    drop(shared);
+
+                    let mut file_shared = current_file.lock();
+                    if !file_shared.writer_finished {
+                        if let Some(mut writer) = file_shared.writer.take() {
+                            writer.finish()?;
+                        }
+                        file_shared.writer_finished = true;
+                        file_shared.wake();
+                    }
+                    drop(file_shared);
+
+                    shared = self.shared.lock();
+                }
+            }
+            shared.wake();
         }
 
         Ok(())
@@ -258,30 +310,45 @@ impl Drop for SpillPoolWriter {
             return;
         }
 
-        // Finalize the current file when the last writer is dropped
-        if let Some(current_file) = shared.current_write_file.take() {
-            // Release shared lock before locking file
-            drop(shared);
+        // Finalize EVERY not-yet-finished file in the queue when the last writer is
+        // dropped — not just `current_write_file`.
+        //
+        // Writer clones are dropped concurrently and from different threads ( For example : the two
+        // `RepartitionExec` input tasks plus the original writer held in
+        // `PartitionChannels`, which `execute()` drops via `..`). Only the clone that
+        // observes `active_writer_count == 0` finalizes, and previously it finalized
+        // only `current_write_file`. Under an unlucky interleaving a *different*
+        // clone could leave a non-current file in the queue with
+        // `writer_finished == false` and its IPC writer still held (`writer =
+        // Some`). A `SpillFile` reader draining that orphaned file only ever exits on
+        // per-file `writer_finished` — so it would park forever waiting for an EOF
+        // that never comes.
+        //
+        // Finalizing all queued files here guarantees no reader can be stranded,
+        // regardless of which clone created which file or how the drops interleave.
+        let files: Vec<_> = shared.files.iter().map(Arc::clone).collect();
+        shared.current_write_file = None;
+        // Release the shared lock before taking per-file locks (lock ordering).
+        drop(shared);
 
-            let mut file_shared = current_file.lock();
-
-            // Finish the current writer if it exists
+        for file in files {
+            let mut file_shared = file.lock();
+            if file_shared.writer_finished {
+                continue;
+            }
+            // Finish the IPC writer if this file still holds one.
             if let Some(mut writer) = file_shared.writer.take() {
                 // Ignore errors on drop - we're in destructor
                 let _ = writer.finish();
             }
-
             // Mark as finished so readers know not to wait for more data
             file_shared.writer_finished = true;
-
-            // Wake reader waiting on this file (it's now finished)
+            // Wake any reader parked on this specific file.
             file_shared.wake();
-
-            drop(file_shared);
-            shared = self.shared.lock();
         }
 
         // Mark writer as dropped and wake pool-level readers
+        let mut shared = self.shared.lock();
         shared.writer_dropped = true;
         shared.wake();
     }
@@ -519,6 +586,10 @@ struct SpillFileReader {
 struct SpillFile {
     /// Shared coordination state (contains writer and batch counts)
     shared: Arc<Mutex<ActiveSpillFileShared>>,
+    /// Pool-level shared state, so this per-file reader can observe pool EOF
+    /// (`writer_dropped`) even if this file was never individually marked
+    /// `writer_finished` (belt-and-suspenders against an orphaned file).
+    pool: Arc<Mutex<SpillPoolShared>>,
     /// Reader state (lazy-initialized, owned by this SpillFile)
     reader: Option<SpillFileReader>,
     /// Spill manager for creating readers
@@ -553,8 +624,17 @@ impl Stream for SpillFile {
                 // No more data and writer is done - EOF
                 return Poll::Ready(None);
             } else {
-                // Caught up to writer, but writer still active - register waker and wait
+                // Caught up to writer, but this file is not marked finished.
+                // Register the per-file waker, then (with the file lock released)
+                // consult pool-level EOF: if the last writer clone was dropped, no
+                // more data can arrive for this file, so treat it as EOF even though
+                // `writer_finished` was never set — covers an orphaned file left by a
+                // racy writer-clone drop, so a reader is never stranded.
                 shared.register_waker(cx.waker().clone());
+                drop(shared);
+                if self.pool.lock().writer_dropped {
+                    return Poll::Ready(None);
+                }
                 return Poll::Pending;
             }
         }; // Lock released here
@@ -709,10 +789,12 @@ impl Stream for SpillPoolReader {
                 // Create a SpillFile from the shared state
                 let spill_manager = Arc::clone(&shared.spill_manager);
                 let file_shared = Arc::clone(file_shared);
+                let pool = Arc::clone(&self.shared);
                 drop(shared); // Release lock before creating SpillFile
 
                 self.current_file = Some(SpillFile {
                     shared: file_shared,
+                    pool,
                     reader: None,
                     spill_manager,
                 });
@@ -1281,6 +1363,156 @@ mod tests {
         Ok(())
     }
 
+    struct WakeCounter {
+        wakes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl futures::task::ArcWake for WakeCounter {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self
+                .wakes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    struct SpillPoolAfterSelectWriteFileHookGuard;
+
+    impl Drop for SpillPoolAfterSelectWriteFileHookGuard {
+        fn drop(&mut self) {
+            *SPILL_POOL_AFTER_SELECT_WRITE_FILE_HOOK
+                .lock()
+                .expect("spill pool hook mutex poisoned") = None;
+        }
+    }
+
+    fn install_spill_pool_after_select_write_file_hook(
+        hook: SpillPoolAfterSelectWriteFileHook,
+    ) -> SpillPoolAfterSelectWriteFileHookGuard {
+        *SPILL_POOL_AFTER_SELECT_WRITE_FILE_HOOK
+            .lock()
+            .expect("spill pool hook mutex poisoned") = Some(hook);
+        SpillPoolAfterSelectWriteFileHookGuard
+    }
+
+    /// Regression test for a real concurrent writer-clone interleaving.
+    ///
+    /// One writer temporarily removes `current_write_file` while doing file I/O.
+    /// A second writer can observe that `None`, create a new spill file, and make
+    /// it current. The first writer must not overwrite that newer current file
+    /// when it finishes its append. If it does, the newer file remains queued but
+    /// orphaned, and the reader can park forever on the older unfinished file
+    /// even though the newer file already contains data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_writer_does_not_orphan_newer_spill_file() -> Result<()> {
+        let (writer1, mut reader) = create_spill_channel(1024 * 1024);
+        let writer2 = writer1.clone();
+
+        writer1.push_batch(&create_test_batch(0, 10))?;
+        let batch = reader.next().await.unwrap()?;
+        assert_eq!(batch.num_rows(), 10);
+
+        let (start_writer2_tx, start_writer2_rx) = std::sync::mpsc::channel::<()>();
+        let (writer2_done_tx, writer2_done_rx) = std::sync::mpsc::channel::<()>();
+        let writer2_thread = std::thread::spawn(move || {
+            start_writer2_rx
+                .recv()
+                .expect("writer1 should trigger the racing writer");
+            writer2
+                .push_batch(&create_test_batch(20, 10))
+                .expect("racing writer should append to the newer file");
+            writer2_done_tx
+                .send(())
+                .expect("writer1 should wait for racing writer completion");
+        });
+
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer2_done_rx = Arc::new(std::sync::Mutex::new(writer2_done_rx));
+        let _hook_guard = install_spill_pool_after_select_write_file_hook(Arc::new({
+            let hook_fired = Arc::clone(&hook_fired);
+            move || {
+                if hook_fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                start_writer2_tx
+                    .send(())
+                    .expect("racing writer should be waiting");
+                writer2_done_rx
+                    .lock()
+                    .expect("writer2_done receiver mutex poisoned")
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("racing writer should finish while writer1's file is absent");
+            }
+        }));
+
+        writer1.push_batch(&create_test_batch(10, 10))?;
+        assert!(
+            hook_fired.load(std::sync::atomic::Ordering::SeqCst),
+            "test must force the concurrent writer interleaving"
+        );
+
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.next())
+                .await
+                .expect("reader should read writer1's second batch")
+                .expect("writer1's second batch should be present")?;
+        assert_eq!(batch.num_rows(), 10);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 10);
+
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.next())
+                .await
+                .expect("reader should advance to the newer file instead of parking")
+                .expect("newer racing writer batch should be present")?;
+        assert_eq!(batch.num_rows(), 10);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 20);
+
+        writer2_thread
+            .join()
+            .expect("racing writer thread should not panic");
+        drop(writer1);
+
+        Ok(())
+    }
+
+    /// Regression test for the two-waker coordination bug: writer progress on
+    /// an already-open file must wake a reader registered at the pool level too.
+    ///
+    /// The single reader may end up parked in either `SpillPoolReader` or
+    /// `SpillFile` depending on which layer observed `Pending`. If append/finish
+    /// only wakes the per-file slot, a pool-level waiter can be stranded even
+    /// though new data is available in the current file.
+    #[test]
+    fn test_file_append_wakes_pool_level_waiter() -> Result<()> {
+        let (writer, _reader) = create_spill_channel(1024 * 1024);
+
+        writer.push_batch(&create_test_batch(0, 10))?;
+
+        let wake_counter = Arc::new(WakeCounter {
+            wakes: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let waker = futures::task::waker(Arc::clone(&wake_counter));
+        writer.shared.lock().register_waker(waker);
+
+        writer.push_batch(&create_test_batch(10, 10))?;
+
+        assert!(
+            wake_counter.wakes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "appending to an existing spill file must also wake pool-level waiters"
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_reader_starts_after_writer_finishes() -> Result<()> {
         let (writer, reader) = create_spill_channel(128);
@@ -1363,6 +1595,116 @@ mod tests {
         }
 
         assert_eq!(count, 5, "Should read all batches after writer is dropped");
+
+        Ok(())
+    }
+
+    /// Regression test for the last-writer drop path: an unfinished file that is
+    /// still queued but is no longer `current_write_file` must still be
+    /// finalized.
+    ///
+    /// The production wedge was observed with a reader caught up to an
+    /// unfinished queued file after pool EOF. This test constructs that exact
+    /// orphaned-file shape deterministically by removing the writer's
+    /// `current_write_file` reference while leaving the file in the FIFO queue.
+    /// Before the finalize-all-on-drop fix, dropping the writer only finalized
+    /// `current_write_file`, so this queued file stayed unfinished forever.
+    #[tokio::test]
+    async fn test_last_writer_drop_finalizes_orphaned_queued_file() -> Result<()> {
+        let (writer, _reader) = create_spill_channel(1024 * 1024);
+
+        writer.push_batch(&create_test_batch(0, 10))?;
+
+        let orphaned_file = {
+            let mut shared = writer.shared.lock();
+            let orphaned_file = Arc::clone(
+                shared
+                    .files
+                    .front()
+                    .expect("writer should have queued the active spill file"),
+            );
+
+            // Simulate the observed terminal state: the file remains visible to
+            // the reader via the FIFO queue but is no longer considered the
+            // writer's current file. The drop path must finalize queued files,
+            // not just `current_write_file`.
+            shared.current_write_file = None;
+            orphaned_file
+        };
+
+        drop(writer);
+
+        let file_shared = orphaned_file.lock();
+        assert!(
+            file_shared.writer_finished,
+            "last writer drop must mark every queued file as finished"
+        );
+        assert!(
+            file_shared.writer.is_none(),
+            "last writer drop must finish and clear every queued IPC writer"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for the stranded-reader half of the same failure mode.
+    ///
+    /// A reader that has consumed all currently written batches from an
+    /// unfinished file must not wait forever once the pool-level writer has been
+    /// dropped. Without the pool EOF check in `SpillFile`, the second
+    /// `reader.next()` below registers the per-file waker and remains pending:
+    /// no writer exists to append more data or mark that specific file finished.
+    #[tokio::test]
+    async fn test_reader_observes_pool_eof_for_orphaned_unfinished_file() -> Result<()> {
+        let env = Arc::new(RuntimeEnv::default());
+        let metrics = SpillMetrics::new(&ExecutionPlanMetricsSet::new(), 0);
+        let schema = create_test_schema();
+        let spill_manager =
+            Arc::new(SpillManager::new(env, metrics, Arc::clone(&schema)));
+
+        let mut in_progress =
+            spill_manager.create_in_progress_file("orphaned spill file")?;
+        in_progress.append_batch(&create_test_batch(0, 10))?;
+        in_progress.flush()?;
+        let file = in_progress
+            .file()
+            .expect("appending a batch should create an in-progress file")
+            .clone();
+
+        let file_shared = Arc::new(Mutex::new(ActiveSpillFileShared {
+            writer: Some(in_progress),
+            file: Some(file),
+            batches_written: 1,
+            estimated_size: 0,
+            writer_finished: false,
+            waker: None,
+        }));
+
+        let shared =
+            Arc::new(Mutex::new(SpillPoolShared::new(Arc::clone(&spill_manager))));
+        {
+            let mut shared = shared.lock();
+            shared.files.push_back(file_shared);
+            shared.writer_dropped = true;
+            shared.active_writer_count = 0;
+        }
+
+        let mut reader = SpillPoolReader::new(shared, schema);
+
+        let batch =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reader.next())
+                .await
+                .expect("reader should read the already-written batch")
+                .expect("reader should yield the already-written batch")?;
+        assert_eq!(batch.num_rows(), 10);
+
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(1), reader.next())
+            .await
+            .expect("reader must observe pool EOF instead of parking forever");
+        assert!(
+            eof.is_none(),
+            "orphaned unfinished file should end once the pool writer is dropped"
+        );
 
         Ok(())
     }
