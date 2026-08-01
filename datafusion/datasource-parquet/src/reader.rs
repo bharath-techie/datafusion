@@ -46,6 +46,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -70,6 +71,77 @@ pub struct ParquetForwardBatchReader {
     pages: Vec<ParquetForwardPage>,
     metadata: Arc<ParquetMetaData>,
     projected_leaf_column: usize,
+}
+
+/// Reusable DataFusion-backed factory for independent forward readers over the
+/// same file, metadata, and projection.
+pub struct ParquetForwardBatchReaderFactory {
+    reader_factory: Arc<dyn ParquetFileReaderFactory>,
+    file: PartitionedFile,
+    metadata: Arc<ParquetMetaData>,
+    projection: ProjectionMask,
+    batch_size: usize,
+    runtime: Arc<Runtime>,
+    local_file: Option<PathBuf>,
+}
+
+impl ParquetForwardBatchReaderFactory {
+    /// Creates a factory whose readers all use the supplied DataFusion file
+    /// reader factory and cached Parquet metadata.
+    pub fn new(
+        reader_factory: Arc<dyn ParquetFileReaderFactory>,
+        file: PartitionedFile,
+        metadata: Arc<ParquetMetaData>,
+        projection: ProjectionMask,
+        batch_size: usize,
+        runtime: Arc<Runtime>,
+    ) -> Self {
+        Self {
+            reader_factory,
+            file,
+            metadata,
+            projection,
+            batch_size,
+            runtime,
+            local_file: None,
+        }
+    }
+
+    /// Uses a synchronous retained file descriptor when `path` identifies an
+    /// existing local file. Other files continue through DataFusion's reader
+    /// factory.
+    pub fn with_local_file_if_exists(mut self, path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        self.local_file = path.is_file().then_some(path);
+        self
+    }
+
+    /// Opens a new retained forward reader.
+    pub fn open(&self) -> ParquetResult<ParquetForwardBatchReader> {
+        if let Some(path) = self.local_file.as_ref() {
+            let file = std::fs::File::open(path)
+                .map_err(|error| ArrowParquetError::External(Box::new(error)))?;
+            return ParquetForwardBatchReader::try_new_with_chunk_reader(
+                file,
+                Arc::clone(&self.metadata),
+                self.projection.clone(),
+                self.batch_size,
+            );
+        }
+        let metrics = ExecutionPlanMetricsSet::new();
+        let async_reader = self
+            .reader_factory
+            .create_reader(0, self.file.clone(), None, &metrics)
+            .map_err(|error| ArrowParquetError::External(Box::new(error)))?;
+        ParquetForwardBatchReader::try_new(
+            async_reader,
+            self.file.object_meta.size,
+            Arc::clone(&self.metadata),
+            self.projection.clone(),
+            self.batch_size,
+            Arc::clone(&self.runtime),
+        )
+    }
 }
 
 /// OffsetIndex and ColumnIndex information for one projected data page.
@@ -236,6 +308,42 @@ impl ParquetForwardBatchReader {
         self.physical_position = target_row + batch.num_rows();
         self.position = self.physical_position;
         Ok(Some(batch))
+    }
+
+    /// Skips to `target_row` and decodes up to `max_rows`, crossing data-page
+    /// and row-group boundaries without rebuilding the retained Arrow reader.
+    pub fn read_range_at(
+        &mut self,
+        target_row: usize,
+        max_rows: usize,
+    ) -> ParquetResult<Option<RecordBatch>> {
+        let Some(first) = self.read_batch_at(target_row, max_rows)? else {
+            return Ok(None);
+        };
+        let end = target_row.saturating_add(max_rows).min(self.row_count);
+        if self.position >= end {
+            return Ok(Some(first));
+        }
+
+        let schema = first.schema();
+        let mut batches = vec![first];
+        while self.position < end {
+            let position = self.position;
+            let batch =
+                self.read_batch_at(position, end - position)?
+                    .ok_or_else(|| {
+                        ArrowParquetError::General(format!(
+                            "Parquet reader exhausted before row {position}"
+                        ))
+                    })?;
+            if batch.num_rows() == 0 {
+                return Err(ArrowParquetError::General(format!(
+                    "Parquet reader made no progress at row {position}"
+                )));
+            }
+            batches.push(batch);
+        }
+        Ok(Some(arrow::compute::concat_batches(&schema, &batches)?))
     }
 
     /// Current physical row position of the retained Arrow reader.
@@ -461,6 +569,78 @@ impl ChunkReader for AsyncFileChunkReader {
         }
         self.runtime
             .block_on(self.reader.lock().get_bytes(start..end))
+    }
+}
+
+#[cfg(test)]
+mod forward_batch_reader_tests {
+    use super::*;
+    use arrow::array::{Array, Int32Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use parquet::arrow::ArrowWriter;
+    use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
+    use parquet::file::properties::WriterProperties;
+    use std::fs::File;
+
+    fn test_reader() -> ParquetForwardBatchReader {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from_iter_values(0..20))],
+        )
+        .unwrap();
+        let file = tempfile::tempfile().unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(8)
+            .set_data_page_row_count_limit(3)
+            .set_offset_index_disabled(false)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file.try_clone().unwrap(), schema, Some(properties))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let metadata = ParquetMetaDataReader::new()
+            .with_page_index_policy(PageIndexPolicy::Required)
+            .parse_and_finish(&file)
+            .unwrap();
+        let metadata = Arc::new(metadata);
+        let projection =
+            ProjectionMask::leaves(metadata.file_metadata().schema_descr(), [0]);
+        ParquetForwardBatchReader::try_new_with_chunk_reader(
+            File::from(file),
+            metadata,
+            projection,
+            20,
+        )
+        .unwrap()
+    }
+
+    fn values(batch: &RecordBatch) -> Vec<i32> {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn read_range_crosses_page_boundary() {
+        let batch = test_reader().read_range_at(2, 4).unwrap().unwrap();
+        assert_eq!(values(&batch), vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn read_range_crosses_row_group_boundary() {
+        let batch = test_reader().read_range_at(6, 5).unwrap().unwrap();
+        assert_eq!(values(&batch), vec![6, 7, 8, 9, 10]);
     }
 }
 
