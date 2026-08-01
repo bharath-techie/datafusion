@@ -20,6 +20,8 @@
 
 use crate::ParquetFileMetrics;
 use crate::metadata::DFParquetMetadata;
+use arrow::array::new_null_array;
+use arrow::record_batch::{RecordBatch, RecordBatchReader};
 use bytes::Bytes;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::cache::cache_manager::FileMetadata;
@@ -28,14 +30,439 @@ use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use object_store::ObjectStore;
-use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parking_lot::Mutex;
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
+    ParquetRecordBatchReaderBuilder,
+};
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+use parquet::errors::{ParquetError as ArrowParquetError, Result as ParquetResult};
 use parquet::file::metadata::ParquetMetaData;
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
+use parquet::file::reader::{ChunkReader, Length};
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::io::Cursor;
 use std::ops::Range;
 use std::sync::Arc;
+use tokio::runtime::Runtime;
+
+/// A forward-only, page-lazy Parquet batch reader backed by either a DataFusion
+/// [`AsyncFileReader`] or an existing synchronous [`ChunkReader`].
+///
+/// Unlike [`crate::source::ParquetSource`], this reader does not require a
+/// [`parquet::arrow::arrow_reader::RowSelection`] to be known when it is
+/// created. [`Self::read_batch_at`] advances one retained Arrow reader, so
+/// complete pages between the current position and the requested row are
+/// skipped without fetching or decoding them.
+///
+/// The projected columns must have an OffsetIndex for every non-empty row
+/// group. This lets Arrow request complete page ranges with `get_bytes`; the
+/// full compressed column chunk is never buffered.
+pub struct ParquetForwardBatchReader {
+    reader: ParquetRecordBatchReader,
+    physical_position: usize,
+    position: usize,
+    row_count: usize,
+    repeated: bool,
+    pages: Vec<ParquetForwardPage>,
+    metadata: Arc<ParquetMetaData>,
+    projected_leaf_column: usize,
+}
+
+/// OffsetIndex and ColumnIndex information for one projected data page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParquetForwardPage {
+    pub row_group_index: usize,
+    pub page_index: usize,
+    pub first_row: usize,
+    pub row_count: usize,
+    pub file_offset: i64,
+    pub compressed_size: i32,
+    pub null_count: Option<i64>,
+    pub all_null: bool,
+}
+
+impl Debug for ParquetForwardBatchReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParquetForwardBatchReader")
+            .field("position", &self.position)
+            .field("physical_position", &self.physical_position)
+            .field("row_count", &self.row_count)
+            .field("page_count", &self.pages.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ParquetForwardBatchReader {
+    /// Creates a retained Arrow reader over the full file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        async_reader: Box<dyn AsyncFileReader + Send>,
+        file_len: u64,
+        metadata: Arc<ParquetMetaData>,
+        projection: ProjectionMask,
+        batch_size: usize,
+        runtime: Arc<Runtime>,
+    ) -> ParquetResult<Self> {
+        let chunk_reader = AsyncFileChunkReader {
+            reader: Mutex::new(async_reader),
+            file_len,
+            runtime,
+        };
+        Self::try_new_with_chunk_reader(chunk_reader, metadata, projection, batch_size)
+    }
+
+    /// Creates a retained Arrow reader over an existing synchronous chunk
+    /// reader, while reusing metadata loaded by DataFusion.
+    pub fn try_new_with_chunk_reader<T>(
+        chunk_reader: T,
+        metadata: Arc<ParquetMetaData>,
+        projection: ProjectionMask,
+        batch_size: usize,
+    ) -> ParquetResult<Self>
+    where
+        T: ChunkReader + 'static,
+    {
+        let (projected_leaf_column, repeated, pages) =
+            projected_pages(&metadata, &projection)?;
+
+        let row_count =
+            usize::try_from(metadata.file_metadata().num_rows()).map_err(|_| {
+                ArrowParquetError::General(
+                    "Parquet row count does not fit in usize".to_string(),
+                )
+            })?;
+        let arrow_metadata = ArrowReaderMetadata::try_new(
+            Arc::clone(&metadata),
+            ArrowReaderOptions::new(),
+        )?;
+        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            chunk_reader,
+            arrow_metadata,
+        )
+        .with_projection(projection)
+        .with_batch_size(batch_size.max(1))
+        .build()?;
+
+        Ok(Self {
+            reader,
+            physical_position: 0,
+            position: 0,
+            row_count,
+            repeated,
+            pages,
+            metadata,
+            projected_leaf_column,
+        })
+    }
+
+    /// Skips to `target_row` and decodes the next Arrow batch.
+    ///
+    /// Returns `None` when `target_row == self.row_count()`. Backward seeks and
+    /// rows beyond the end of the file return an error.
+    pub fn read_batch_at(
+        &mut self,
+        target_row: usize,
+        max_rows: usize,
+    ) -> ParquetResult<Option<RecordBatch>> {
+        if target_row > self.row_count {
+            return Err(ArrowParquetError::General(format!(
+                "row {target_row} is beyond Parquet row count {}",
+                self.row_count
+            )));
+        }
+        if target_row < self.position {
+            return Err(ArrowParquetError::General(format!(
+                "backward seek from {} to {target_row} is not supported",
+                self.position
+            )));
+        }
+        if target_row == self.row_count {
+            return Ok(None);
+        }
+        if max_rows == 0 {
+            return Err(ArrowParquetError::General(
+                "forward batch size must be greater than zero".to_string(),
+            ));
+        }
+
+        let page = self.page_at(target_row)?.clone();
+        let rows_to_read = max_rows.min(page.first_row + page.row_count - target_row);
+        if page.all_null {
+            let page_end = page.first_row + page.row_count;
+            if self.physical_position < page_end {
+                let to_skip = page_end - self.physical_position;
+                let skipped = self.reader.skip_rows(to_skip)?;
+                if skipped != to_skip {
+                    return Err(ArrowParquetError::General(format!(
+                        "requested all-null page skip of {to_skip} rows but skipped {skipped}"
+                    )));
+                }
+                self.physical_position = page_end;
+            }
+            let schema = self.reader.schema();
+            let columns = schema
+                .fields()
+                .iter()
+                .map(|field| new_null_array(field.data_type(), rows_to_read))
+                .collect();
+            let batch = RecordBatch::try_new(schema, columns)?;
+            self.position = target_row + rows_to_read;
+            return Ok(Some(batch));
+        }
+
+        if target_row < self.physical_position {
+            return Err(ArrowParquetError::General(format!(
+                "physical reader is at {} before non-null row {target_row}",
+                self.physical_position
+            )));
+        }
+        let to_skip = target_row - self.physical_position;
+        let skipped = self.reader.skip_rows(to_skip)?;
+        if skipped != to_skip {
+            return Err(ArrowParquetError::General(format!(
+                "requested skip of {to_skip} rows but skipped {skipped}"
+            )));
+        }
+
+        let batch = self.reader.read_next_batch(rows_to_read)?.ok_or_else(|| {
+            ArrowParquetError::General(format!(
+                "Parquet reader exhausted before row {target_row}"
+            ))
+        })?;
+        self.physical_position = target_row + batch.num_rows();
+        self.position = self.physical_position;
+        Ok(Some(batch))
+    }
+
+    /// Current physical row position of the retained Arrow reader.
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    /// Total rows in the Parquet file.
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Number of physical rows in the page containing `target_row`.
+    pub fn page_row_count(&self, target_row: usize) -> ParquetResult<usize> {
+        Ok(self.page_at(target_row)?.row_count)
+    }
+
+    /// Number of physical rows from `target_row` through the end of its page.
+    pub fn rows_remaining_in_page(&self, target_row: usize) -> ParquetResult<usize> {
+        let page = self.page_at(target_row)?;
+        Ok(page.first_row + page.row_count - target_row)
+    }
+
+    /// Page metadata for the projected leaf column.
+    pub fn pages(&self) -> &[ParquetForwardPage] {
+        &self.pages
+    }
+
+    /// Parquet metadata containing the scoped OffsetIndex and ColumnIndex.
+    pub fn metadata(&self) -> &ParquetMetaData {
+        &self.metadata
+    }
+
+    /// Projected Parquet leaf-column index.
+    pub fn projected_leaf_column(&self) -> usize {
+        self.projected_leaf_column
+    }
+
+    /// Whether the projected leaf belongs to a repeated Parquet field.
+    pub fn is_repeated(&self) -> bool {
+        self.repeated
+    }
+
+    fn page_at(&self, target_row: usize) -> ParquetResult<&ParquetForwardPage> {
+        let index = self
+            .pages
+            .partition_point(|page| page.first_row + page.row_count <= target_row);
+        self.pages
+            .get(index)
+            .filter(|page| {
+                target_row >= page.first_row
+                    && target_row < page.first_row + page.row_count
+            })
+            .ok_or_else(|| {
+                ArrowParquetError::General(format!(
+                    "OffsetIndex does not contain row {target_row}"
+                ))
+            })
+    }
+}
+
+fn projected_pages(
+    metadata: &ParquetMetaData,
+    projection: &ProjectionMask,
+) -> ParquetResult<(usize, bool, Vec<ParquetForwardPage>)> {
+    let schema = metadata.file_metadata().schema_descr();
+    let projected_columns = (0..schema.num_columns())
+        .filter(|&column_idx| projection.leaf_included(column_idx))
+        .collect::<Vec<_>>();
+    let [column_idx] = projected_columns.as_slice() else {
+        return Err(ArrowParquetError::General(format!(
+            "ParquetForwardBatchReader requires exactly one projected leaf column, got {}",
+            projected_columns.len()
+        )));
+    };
+    let repeated = schema.column(*column_idx).max_rep_level() > 0;
+
+    let offset_index = metadata.offset_index().ok_or_else(|| {
+        ArrowParquetError::General(
+            "ParquetForwardBatchReader requires an OffsetIndex".to_string(),
+        )
+    })?;
+    let mut row_group_start = 0usize;
+    let column_index = metadata.column_index();
+    let mut pages = vec![];
+    for (row_group_idx, row_group) in metadata.row_groups().iter().enumerate() {
+        let row_group_rows = usize::try_from(row_group.num_rows()).map_err(|_| {
+            ArrowParquetError::General(format!(
+                "negative row count for row group {row_group_idx}"
+            ))
+        })?;
+        if row_group_rows == 0 {
+            continue;
+        }
+        let locations = &offset_index
+            .get(row_group_idx)
+            .and_then(|row_group| row_group.get(*column_idx))
+            .filter(|index| !index.page_locations.is_empty())
+            .ok_or_else(|| {
+                ArrowParquetError::General(format!(
+                    "OffsetIndex missing for row group {row_group_idx}, column {column_idx}"
+                ))
+            })?
+            .page_locations;
+
+        // Repeated values can span data-page boundaries, and consecutive
+        // PageLocations may therefore identify the same first logical row.
+        // Arrow's retained ArrayReader still skips and decodes those pages
+        // lazily using the full OffsetIndex. For cursor planning, expose one
+        // non-overlapping logical region per row group instead of pretending
+        // page boundaries are record boundaries.
+        if repeated {
+            let first = locations
+                .first()
+                .ok_or_else(|| {
+                    ArrowParquetError::General(format!(
+                        "OffsetIndex missing for row group {row_group_idx}, column {column_idx}"
+                    ))
+                })?;
+            let compressed_size = locations
+                .iter()
+                .try_fold(0i64, |total, page| {
+                    total.checked_add(i64::from(page.compressed_page_size))
+                })
+                .and_then(|total| i32::try_from(total).ok())
+                .unwrap_or(i32::MAX);
+            pages.push(ParquetForwardPage {
+                row_group_index: row_group_idx,
+                page_index: 0,
+                first_row: row_group_start,
+                row_count: row_group_rows,
+                file_offset: first.offset,
+                compressed_size,
+                null_count: None,
+                all_null: false,
+            });
+            row_group_start += row_group_rows;
+            continue;
+        }
+
+        let page_statistics = column_index
+            .and_then(|index| index.get(row_group_idx))
+            .and_then(|row_group| row_group.get(*column_idx))
+            .filter(|index| !matches!(index, ColumnIndexMetaData::NONE));
+
+        for (page_idx, location) in locations.iter().enumerate() {
+            let start = usize::try_from(location.first_row_index).map_err(|_| {
+                ArrowParquetError::General(format!(
+                    "negative first row for row group {row_group_idx}, page {page_idx}"
+                ))
+            })?;
+            let end = match locations.get(page_idx + 1) {
+                Some(next) => usize::try_from(next.first_row_index).map_err(|_| {
+                    ArrowParquetError::General(format!(
+                        "negative first row for row group {row_group_idx}, page {}",
+                        page_idx + 1
+                    ))
+                })?,
+                None => row_group_rows,
+            };
+            if start >= end || end > row_group_rows {
+                return Err(ArrowParquetError::General(format!(
+                    "invalid OffsetIndex row range {start}..{end} for row group {row_group_idx}"
+                )));
+            }
+            let null_count = page_statistics.and_then(|index| {
+                (page_idx < index.num_pages() as usize)
+                    .then(|| index.null_count(page_idx))
+                    .flatten()
+            });
+            let all_null = page_statistics.is_some_and(|index| {
+                page_idx < index.num_pages() as usize && index.is_null_page(page_idx)
+            }) || null_count == Some((end - start) as i64);
+            pages.push(ParquetForwardPage {
+                row_group_index: row_group_idx,
+                page_index: page_idx,
+                first_row: row_group_start + start,
+                row_count: end - start,
+                file_offset: location.offset,
+                compressed_size: location.compressed_page_size,
+                null_count,
+                all_null,
+            });
+        }
+        row_group_start += row_group_rows;
+    }
+    Ok((*column_idx, repeated, pages))
+}
+
+/// Adapts DataFusion's cache-aware async reader to Arrow's lazy synchronous
+/// page reader. Calls are serialized because `AsyncFileReader` takes `&mut
+/// self`, matching the single-threaded cursor contract.
+struct AsyncFileChunkReader {
+    reader: Mutex<Box<dyn AsyncFileReader + Send>>,
+    file_len: u64,
+    runtime: Arc<Runtime>,
+}
+
+impl Length for AsyncFileChunkReader {
+    fn len(&self) -> u64 {
+        self.file_len
+    }
+}
+
+impl ChunkReader for AsyncFileChunkReader {
+    type T = Cursor<Bytes>;
+
+    fn get_read(&self, start: u64) -> ParquetResult<Self::T> {
+        Err(ArrowParquetError::General(format!(
+            "page-header scanning at byte {start} is disabled; an OffsetIndex is required"
+        )))
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> ParquetResult<Bytes> {
+        let end = start.checked_add(length as u64).ok_or_else(|| {
+            ArrowParquetError::General("page range overflow".to_string())
+        })?;
+        if end > self.file_len {
+            return Err(ArrowParquetError::General(format!(
+                "page range {start}..{end} exceeds file length {}",
+                self.file_len
+            )));
+        }
+        self.runtime
+            .block_on(self.reader.lock().get_bytes(start..end))
+    }
+}
 
 /// Interface for reading Apache Parquet files.
 ///
