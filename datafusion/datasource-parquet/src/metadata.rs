@@ -19,6 +19,7 @@
 //! and schema information.
 
 use crate::file_format::ObjectStoreFetch;
+use crate::page_index_cache::{CachedPageIndexes, PageIndexSelection};
 use crate::{Int96Coercer, apply_file_schema_type_coercions};
 use arrow::array::{Array, ArrayRef, BooleanArray};
 use arrow::compute::kernels::cmp::eq;
@@ -40,6 +41,7 @@ use datafusion_physical_plan::Accumulator;
 use log::debug;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
+use parking_lot::RwLock;
 use parquet::DecodeResult;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::{parquet_column, parquet_to_arrow_schema};
@@ -923,15 +925,45 @@ fn has_any_exact_match(
 }
 
 /// Wrapper to implement [`FileMetadata`] for [`ParquetMetaData`].
-pub struct CachedParquetMetaData(Arc<ParquetMetaData>);
+///
+/// Besides the footer metadata, the entry accumulates selectively decoded
+/// page-index entries (see [`crate::page_index_cache`]). Scans read the
+/// entries they need and merge newly decoded ones in place, so the footer
+/// and its page indexes share one cache entry: admitted, memory-accounted,
+/// and evicted together.
+pub struct CachedParquetMetaData {
+    metadata: Arc<ParquetMetaData>,
+    /// Selectively decoded page-index entries for this file, merged in
+    /// place as scans need them. Interior mutability lets concurrent scans
+    /// merge without replacing the cache entry.
+    page_indexes: RwLock<CachedPageIndexes>,
+}
 
 impl CachedParquetMetaData {
     pub fn new(metadata: Arc<ParquetMetaData>) -> Self {
-        Self(metadata)
+        Self {
+            metadata,
+            page_indexes: RwLock::new(CachedPageIndexes::new()),
+        }
     }
 
     pub fn parquet_metadata(&self) -> &Arc<ParquetMetaData> {
-        &self.0
+        &self.metadata
+    }
+
+    /// Returns the cached page-index entries matching `selection`.
+    pub fn page_indexes_for(&self, selection: &PageIndexSelection) -> CachedPageIndexes {
+        self.page_indexes.read().subset(selection)
+    }
+
+    /// Merges newly decoded page-index entries into this entry.
+    ///
+    /// Merging never discards previously stored entries, so concurrent
+    /// scans that decoded different columns both retain their results.
+    /// Callers should re-`put` the entry afterwards so the cache refreshes
+    /// its memory accounting.
+    pub fn merge_page_indexes(&self, indexes: CachedPageIndexes) {
+        self.page_indexes.write().extend(indexes);
     }
 }
 
@@ -941,13 +973,20 @@ impl FileMetadata for CachedParquetMetaData {
     }
 
     fn memory_size(&self) -> usize {
-        self.0.memory_size()
+        self.metadata.memory_size() + self.page_indexes.read().memory_estimate()
     }
 
     fn extra_info(&self) -> HashMap<String, String> {
-        let page_index =
-            self.0.column_index().is_some() && self.0.offset_index().is_some();
-        HashMap::from([("page_index".to_owned(), page_index.to_string())])
+        let page_index = self.metadata.column_index().is_some()
+            && self.metadata.offset_index().is_some();
+        let page_indexes = self.page_indexes.read();
+        HashMap::from([
+            ("page_index".to_owned(), page_index.to_string()),
+            (
+                "scoped_page_index_entries".to_owned(),
+                page_indexes.len().to_string(),
+            ),
+        ])
     }
 }
 

@@ -33,6 +33,7 @@ mod metrics;
 mod nested_schema_pruning;
 mod opener;
 mod page_filter;
+pub mod page_index_cache;
 mod projection_read_plan;
 mod push_decoder;
 mod reader;

@@ -68,6 +68,16 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
         metadata_size_hint: Option<usize>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> datafusion_common::Result<Box<dyn AsyncFileReader + Send>>;
+
+    /// Returns the [`FileMetadataCache`] backing this factory, if any.
+    ///
+    /// When present, the opener stores selectively decoded page-index
+    /// entries on the file's cache entry
+    /// ([`CachedParquetMetaData`](crate::metadata::CachedParquetMetaData))
+    /// instead of attaching complete page indexes to the reader metadata.
+    fn file_metadata_cache(&self) -> Option<Arc<FileMetadataCache>> {
+        None
+    }
 }
 
 /// Default implementation of [`ParquetFileReaderFactory`]
@@ -159,6 +169,10 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         .with_metadata_cache(Some(Arc::clone(&self.metadata_cache)));
 
         Ok(Box::new(reader))
+    }
+
+    fn file_metadata_cache(&self) -> Option<Arc<FileMetadataCache>> {
+        Some(Arc::clone(&self.metadata_cache))
     }
 }
 

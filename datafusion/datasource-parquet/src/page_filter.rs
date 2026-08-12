@@ -33,10 +33,15 @@ use datafusion_common::pruning::PruningStatistics;
 use datafusion_physical_expr::{PhysicalExpr, split_conjunction};
 use datafusion_pruning::{PruningPredicate, PruningPredicateBuilder};
 
+use crate::page_index_cache::CachedPageIndexes;
 use log::{debug, trace};
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
-use parquet::file::metadata::{ParquetColumnIndex, ParquetOffsetIndex};
+use parquet::file::metadata::{
+    OffsetIndexBuilder, ParquetColumnIndex, ParquetOffsetIndex,
+};
+use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::page_index::offset_index::PageLocation;
+use parquet::file::page_index::provider::PageIndexProvider;
 use parquet::schema::types::SchemaDescriptor;
 use parquet::{
     arrow::arrow_reader::{RowSelection, RowSelector},
@@ -186,6 +191,7 @@ impl PagePruningAccessPlanFilter {
             arrow_schema,
             parquet_schema,
             parquet_metadata,
+            None,
             file_metrics,
         )
         .access_plan
@@ -193,12 +199,17 @@ impl PagePruningAccessPlanFilter {
 
     /// Returns an updated [`ParquetAccessPlan`] and metrics by applying predicates
     /// to the parquet page index, if any.
+    ///
+    /// Page indexes are taken from `page_indexes` (selectively decoded
+    /// entries for this scan) when provided, otherwise from the dense
+    /// matrices embedded in `parquet_metadata`.
     pub(crate) fn prune_plan_with_page_index_and_metrics(
         &self,
         mut access_plan: ParquetAccessPlan,
         arrow_schema: &Schema,
         parquet_schema: &SchemaDescriptor,
         parquet_metadata: &ParquetMetaData,
+        page_indexes: Option<&CachedPageIndexes>,
         file_metrics: &ParquetFileMetrics,
     ) -> PagePruningResult {
         // scoped timer updates on drop
@@ -214,16 +225,38 @@ impl PagePruningAccessPlanFilter {
             return PagePruningResult::new(access_plan, 0);
         }
 
-        if parquet_metadata.offset_index().is_none()
-            || parquet_metadata.column_index().is_none()
-        {
-            debug!(
-                "Can not prune pages due to lack of indexes. Have offset: {}, column index: {}",
-                parquet_metadata.offset_index().is_some(),
-                parquet_metadata.column_index().is_some()
-            );
-            return PagePruningResult::new(access_plan, 0);
-        };
+        // Materialize the matrices consumed by `StatisticsConverter`.
+        //
+        // Transitional: `StatisticsConverter::data_page_*` currently require
+        // dense `[row_group][column]` matrices, so scoped entries are
+        // expanded with placeholder cells (`ColumnIndexMetaData::NONE`,
+        // empty offset indexes). Only predicate-column cells are read, and
+        // those are real. With sparse (`Option<T>`) page-index matrices in
+        // arrow-rs (apache/arrow-rs#10653) the placeholders will get removed.
+        let scoped_matrices =
+            page_indexes.map(|cached| build_scoped_matrices(cached, parquet_metadata));
+        let (column_index, offset_index): (&ParquetColumnIndex, &ParquetOffsetIndex) =
+            match &scoped_matrices {
+                Some((column_index, offset_index)) => (column_index, offset_index),
+                None => {
+                    match (
+                        parquet_metadata.column_index(),
+                        parquet_metadata.offset_index(),
+                    ) {
+                        (Some(column_index), Some(offset_index)) => {
+                            (column_index, offset_index)
+                        }
+                        (column_index, offset_index) => {
+                            debug!(
+                                "Can not prune pages due to lack of indexes. Have offset: {}, column index: {}",
+                                offset_index.is_some(),
+                                column_index.is_some()
+                            );
+                            return PagePruningResult::new(access_plan, 0);
+                        }
+                    }
+                }
+            };
 
         // track the total number of rows that should be skipped
         let mut total_skip = 0;
@@ -243,8 +276,7 @@ impl PagePruningAccessPlanFilter {
             // Skip page pruning for fully matched row groups: all rows are
             // known to satisfy the predicate, so page-level pruning is wasted work.
             if access_plan.is_fully_matched(row_group_index) {
-                let page_count =
-                    fully_matched_page_count(row_group_index, parquet_metadata);
+                let page_count = fully_matched_page_count(row_group_index, offset_index);
                 total_pages_skipped_by_fully_matched += page_count;
 
                 continue;
@@ -252,12 +284,10 @@ impl PagePruningAccessPlanFilter {
             // The selection for this particular row group
             let mut overall_selection = None;
 
-            let total_pages_in_group =
-                parquet_metadata.offset_index().map_or(0, |offset_index| {
-                    offset_index[row_group_index]
-                        .first()
-                        .map_or(0, |column| column.page_locations.len())
-                });
+            let total_pages_in_group = offset_index
+                .get(row_group_index)
+                .and_then(|columns| columns.first())
+                .map_or(0, |column| column.page_locations().len());
             // stores the indexes of the matched pages
             let mut matched_pages_in_group: HashSet<usize> =
                 HashSet::from_iter(0..total_pages_in_group);
@@ -292,7 +322,9 @@ impl PagePruningAccessPlanFilter {
                     row_group_index,
                     predicate,
                     converter,
-                    parquet_metadata,
+                    column_index,
+                    offset_index,
+                    groups,
                     file_metrics,
                 );
 
@@ -402,13 +434,55 @@ fn update_selection(
 /// the containing row group is fully matched by row-group statistics.
 fn fully_matched_page_count(
     row_group_index: usize,
-    parquet_metadata: &ParquetMetaData,
+    offset_index: &ParquetOffsetIndex,
 ) -> usize {
-    parquet_metadata.offset_index().map_or(0, |offset_index| {
-        offset_index[row_group_index]
-            .first()
-            .map_or(0, |column| column.page_locations.len())
-    })
+    offset_index
+        .get(row_group_index)
+        .and_then(|columns| columns.first())
+        .map_or(0, |column| column.page_locations().len())
+}
+
+/// Expands selectively decoded page-index entries into the dense matrices
+/// consumed by [`StatisticsConverter`].
+///
+/// Cells that were not decoded (unrequested columns, pruned row groups) are
+/// filled with placeholders that page pruning never reads:
+/// [`ColumnIndexMetaData::NONE`] and empty offset indexes. This expansion is
+/// transitional and disappears once arrow-rs represents page-index matrices
+/// sparsely (apache/arrow-rs#10653).
+fn build_scoped_matrices(
+    cached: &CachedPageIndexes,
+    parquet_metadata: &ParquetMetaData,
+) -> (ParquetColumnIndex, ParquetOffsetIndex) {
+    let column_index = parquet_metadata
+        .row_groups()
+        .iter()
+        .enumerate()
+        .map(|(row_group_index, row_group)| {
+            (0..row_group.num_columns())
+                .map(|column| {
+                    PageIndexProvider::column_index(cached, row_group_index, column)
+                        .cloned()
+                        .unwrap_or(ColumnIndexMetaData::NONE)
+                })
+                .collect()
+        })
+        .collect();
+    let offset_index = parquet_metadata
+        .row_groups()
+        .iter()
+        .enumerate()
+        .map(|(row_group_index, row_group)| {
+            (0..row_group.num_columns())
+                .map(|column| {
+                    PageIndexProvider::offset_index(cached, row_group_index, column)
+                        .cloned()
+                        .unwrap_or_else(|| OffsetIndexBuilder::new().build())
+                })
+                .collect()
+        })
+        .collect();
+    (column_index, offset_index)
 }
 
 /// Returns a [`RowSelection`] for the rows in this row group to scan, in addition to a vec of
@@ -423,11 +497,18 @@ fn prune_pages_in_one_row_group(
     row_group_index: usize,
     pruning_predicate: &PruningPredicate,
     converter: StatisticsConverter<'_>,
-    parquet_metadata: &ParquetMetaData,
+    column_index: &ParquetColumnIndex,
+    offset_index: &ParquetOffsetIndex,
+    row_group_metadatas: &[RowGroupMetaData],
     metrics: &ParquetFileMetrics,
 ) -> Option<(RowSelection, Vec<bool>)> {
-    let pruning_stats =
-        PagesPruningStatistics::try_new(row_group_index, converter, parquet_metadata)?;
+    let pruning_stats = PagesPruningStatistics::try_new(
+        row_group_index,
+        converter,
+        column_index,
+        offset_index,
+        row_group_metadatas,
+    )?;
 
     // Each element in values is a boolean indicating whether the page may have
     // values that match the predicate (true) or could not possibly have values
@@ -501,7 +582,9 @@ impl<'a> PagesPruningStatistics<'a> {
     fn try_new(
         row_group_index: usize,
         converter: StatisticsConverter<'a>,
-        parquet_metadata: &'a ParquetMetaData,
+        column_index: &'a ParquetColumnIndex,
+        offset_index: &'a ParquetOffsetIndex,
+        row_group_metadatas: &'a [RowGroupMetaData],
     ) -> Option<Self> {
         let Some(parquet_column_index) = converter.parquet_column_index() else {
             trace!(
@@ -510,10 +593,6 @@ impl<'a> PagesPruningStatistics<'a> {
             );
             return None;
         };
-
-        let column_index = parquet_metadata.column_index()?;
-        let offset_index = parquet_metadata.offset_index()?;
-        let row_group_metadatas = parquet_metadata.row_groups();
 
         let Some(row_group_page_offsets) = offset_index.get(row_group_index) else {
             trace!("No page offsets for row group {row_group_index}, skipping");

@@ -26,6 +26,7 @@ use self::encryption::EncryptionContext;
 use crate::access_plan::PreparedAccessPlan;
 use crate::decoder_projection::DecoderProjection;
 use crate::page_filter::PagePruningAccessPlanFilter;
+use crate::page_index_cache::{CachedPageIndexes, PageIndexSelection};
 use crate::push_decoder::{
     DecoderBuilderConfig, PushDecoderStreamState, RgPlanEntry, RowGroupPruner,
 };
@@ -80,7 +81,9 @@ use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::parquet_column;
 use parquet::basic::Type;
 use parquet::bloom_filter::Sbbf;
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader, RowGroupMetaData};
+use parquet::file::metadata::{
+    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+};
 
 /// Morselizer-level state for virtual columns, precomputed once per scan
 /// partition so each file skips the validator walks, `null_replacements`
@@ -481,6 +484,10 @@ struct FiltersPreparedParquetOpen {
     loaded: MetadataLoadedParquetOpen,
     pruning_predicate: Option<Arc<PruningPredicate>>,
     page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
+    /// Page-index entries selectively loaded for this scan, if any. Served
+    /// to page pruning and the reader as a `PageIndexProvider`; the shared
+    /// footer metadata itself stays index-free.
+    page_indexes: Option<Arc<CachedPageIndexes>>,
 }
 
 /// State of [`ParquetOpenState`]
@@ -1077,6 +1084,7 @@ impl MetadataLoadedParquetOpen {
             },
             pruning_predicate,
             page_pruning_predicate,
+            page_indexes: None,
         })
     }
 }
@@ -1195,17 +1203,135 @@ impl RowGroupsPrunedParquetOpen {
     }
 
     /// Load the page index if pruning requires it and metadata did not include it.
+    ///
+    /// When the reader factory is backed by a [`FileMetadataCache`], only
+    /// the entries the scan needs are retained: column and offset indexes
+    /// for page-pruning predicate columns in surviving, not fully matched
+    /// row groups. Previously decoded entries stored on the file's
+    /// [`CachedParquetMetaData`] entry are reused; newly decoded entries are
+    /// merged back into it. The result is served to page pruning and the
+    /// reader as a `PageIndexProvider` while the cached footer metadata
+    /// stays index-free.
+    ///
+    /// Without a metadata cache, the complete page index is attached to the
+    /// reader metadata (previous behavior).
+    ///
+    /// [`FileMetadataCache`]: datafusion_execution::cache::cache_manager::FileMetadataCache
+    /// [`CachedParquetMetaData`]: crate::metadata::CachedParquetMetaData
     async fn load_page_index(mut self) -> Result<Self> {
-        self.prepared.loaded.reader_metadata = load_page_index(
-            self.prepared.loaded.reader_metadata.clone(),
-            &mut self.prepared.loaded.prepared.async_file_reader,
-            self.prepared
+        let object_meta = self
+            .prepared
+            .loaded
+            .prepared
+            .partitioned_file
+            .object_meta
+            .clone();
+        // The scoped path requires a cache entry for this exact file version.
+        let cache_entry = self
+            .prepared
+            .loaded
+            .prepared
+            .parquet_file_reader_factory
+            .file_metadata_cache()
+            .and_then(|cache| cache.get(&object_meta.location))
+            .filter(|entry| entry.is_valid_for(&object_meta));
+
+        let Some(cache_entry) = cache_entry else {
+            // No metadata cache: attach the complete page index as before.
+            self.prepared.loaded.reader_metadata = load_page_index(
+                self.prepared.loaded.reader_metadata.clone(),
+                &mut self.prepared.loaded.prepared.async_file_reader,
+                self.prepared
+                    .loaded
+                    .options
+                    .clone()
+                    .with_page_index_policy(PageIndexPolicy::Optional),
+            )
+            .await?;
+            return Ok(self);
+        };
+        let Some(cached_parquet) = cache_entry
+            .file_metadata
+            .as_any()
+            .downcast_ref::<crate::metadata::CachedParquetMetaData>(
+        ) else {
+            // Entry holds a foreign FileMetadata implementation; fall back.
+            self.prepared.loaded.reader_metadata = load_page_index(
+                self.prepared.loaded.reader_metadata.clone(),
+                &mut self.prepared.loaded.prepared.async_file_reader,
+                self.prepared
+                    .loaded
+                    .options
+                    .clone()
+                    .with_page_index_policy(PageIndexPolicy::Optional),
+            )
+            .await?;
+            return Ok(self);
+        };
+
+        // Consume the plan into a logical selection: predicate columns of
+        // surviving, not fully matched row groups.
+        let selection = {
+            let parquet_metadata = self.prepared.loaded.reader_metadata.metadata();
+            let arrow_schema = &self.prepared.loaded.prepared.physical_file_schema;
+            let parquet_schema = parquet_metadata.file_metadata().schema_descr();
+            let predicate_leaves: Vec<usize> = self
+                .prepared
+                .page_pruning_predicate
+                .as_ref()
+                .map(|page_pruning_predicate| {
+                    page_pruning_predicate
+                        .predicate_column_names()
+                        .filter_map(|name| {
+                            parquet_column(parquet_schema, arrow_schema, name)
+                                .map(|(leaf_idx, _)| leaf_idx)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let fully_matched = self.row_groups.is_fully_matched();
+            let surviving = self
+                .row_groups
+                .row_group_indexes()
+                .filter(|idx| !fully_matched[*idx]);
+            PageIndexSelection::for_scan(surviving, &predicate_leaves, &[])
+        };
+
+        let mut indexes = cached_parquet.page_indexes_for(&selection);
+        let missing = indexes.missing(&selection);
+        if !missing.is_empty() {
+            // Transitional: arrow-rs cannot decode a subset of page-index
+            // entries yet (apache/arrow-rs#9609), so decode the complete
+            // index and retain only the entries this scan needs. The dense
+            // copy is dropped here; only the scoped entries stay resident
+            // and cached.
+            let dense = load_page_index(
+                self.prepared.loaded.reader_metadata.clone(),
+                &mut self.prepared.loaded.prepared.async_file_reader,
+                self.prepared
+                    .loaded
+                    .options
+                    .clone()
+                    .with_page_index_policy(PageIndexPolicy::Optional),
+            )
+            .await?;
+            let decoded = extract_page_indexes(dense.metadata(), &missing);
+            // Merge in place (concurrent scans keep each other's entries),
+            // then re-put the same entry so the cache refreshes its memory
+            // accounting.
+            cached_parquet.merge_page_indexes(decoded.clone());
+            if let Some(cache) = self
+                .prepared
                 .loaded
-                .options
-                .clone()
-                .with_page_index_policy(PageIndexPolicy::Optional),
-        )
-        .await?;
+                .prepared
+                .parquet_file_reader_factory
+                .file_metadata_cache()
+            {
+                cache.put(&object_meta.location, cache_entry.clone());
+            }
+            indexes.extend(decoded);
+        }
+        self.prepared.page_indexes = Some(Arc::new(indexes));
 
         Ok(self)
     }
@@ -1342,6 +1468,7 @@ impl RowGroupsPrunedParquetOpen {
             loaded,
             pruning_predicate: _,
             page_pruning_predicate,
+            page_indexes,
         } = prepared;
         let MetadataLoadedParquetOpen {
             prepared,
@@ -1375,6 +1502,7 @@ impl RowGroupsPrunedParquetOpen {
                     &prepared.physical_file_schema,
                     reader_metadata.parquet_schema(),
                     file_metadata.as_ref(),
+                    page_indexes.as_deref(),
                     &prepared.file_metrics,
                 );
             access_plan = page_pruning_result.access_plan;
@@ -1471,8 +1599,19 @@ impl RowGroupsPrunedParquetOpen {
                 .map(|rg_index| RgPlanEntry { rg_index })
                 .collect();
 
+            // Serve scoped page indexes to the reader out of band: the
+            // decoder consults them for page locations (applying row
+            // selections, fetching only selected pages) while the shared
+            // footer metadata stays index-free.
+            let decoder_reader_metadata = match &page_indexes {
+                Some(indexes) => reader_metadata
+                    .clone()
+                    .with_page_index_provider(Arc::clone(indexes) as _),
+                None => reader_metadata.clone(),
+            };
+
             let mut builder =
-                decoder_config.build(prepared_access_plan, reader_metadata.clone());
+                decoder_config.build(prepared_access_plan, decoder_reader_metadata);
             if let Some(row_filter) = row_filter_generator.next_filter() {
                 builder = builder.with_row_filter(row_filter);
                 if let Some(max_predicate_cache_size) = prepared.max_predicate_cache_size
@@ -1723,6 +1862,40 @@ async fn load_page_index<T: AsyncFileReader>(
     }
 }
 
+/// Copies the page-index entries in `selection` out of a fully indexed
+/// [`ParquetMetaData`] into a sparse [`CachedPageIndexes`].
+///
+/// Transitional shim: once arrow-rs can decode a subset of page-index
+/// entries directly (apache/arrow-rs#9609), the scoped entries are produced
+/// without materializing the dense matrices first.
+fn extract_page_indexes(
+    parquet_metadata: &ParquetMetaData,
+    selection: &PageIndexSelection,
+) -> CachedPageIndexes {
+    let mut decoded = CachedPageIndexes::new();
+    if let Some(column_index) = parquet_metadata.column_index() {
+        for key in selection.column_indexes() {
+            if let Some(index) = column_index
+                .get(key.row_group_index)
+                .and_then(|row_group| row_group.get(key.column_index))
+            {
+                decoded = decoded.with_column_index(*key, Arc::new(index.clone()));
+            }
+        }
+    }
+    if let Some(offset_index) = parquet_metadata.offset_index() {
+        for key in selection.offset_indexes() {
+            if let Some(index) = offset_index
+                .get(key.row_group_index)
+                .and_then(|row_group| row_group.get(key.column_index))
+            {
+                decoded = decoded.with_offset_index(*key, Arc::new(index.clone()));
+            }
+        }
+    }
+    decoded
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1970,6 +2143,7 @@ mod test {
                 },
                 pruning_predicate: None,
                 page_pruning_predicate,
+                page_indexes: None,
             },
             row_groups: RowGroupAccessPlanFilter::new(plan),
         };
@@ -3157,6 +3331,127 @@ mod test {
             rows_without_page_index, 100,
             "without page index all rows are returned"
         );
+    }
+
+    /// End-to-end scoped page-index flow: with a metadata-cache-backed
+    /// reader factory, page-index entries are decoded once, stored on the
+    /// file's `CachedParquetMetaData` entry, reused by later scans, pruning
+    /// still works, and the cached footer never carries dense page indexes.
+    #[tokio::test]
+    async fn test_scoped_page_index_cache_prunes_and_reuses_entries() {
+        use crate::metadata::CachedParquetMetaData;
+        use crate::page_index_cache::PageIndexKey;
+        use parquet::file::properties::WriterProperties;
+
+        let store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let metadata_cache: Arc<FileMetadataCache> =
+            Arc::new(DefaultCache::<Path, CachedFileMetadataEntry>::new(
+                64 * 1024 * 1024,
+            ));
+
+        // 100 rows with values 1..=100, one row group, 10 rows per page
+        let values: Vec<i32> = (1..=100).collect();
+        let batch = record_batch!((
+            "a",
+            Int32,
+            values.iter().map(|v| Some(*v)).collect::<Vec<_>>()
+        ))
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(10)
+            .set_write_batch_size(10)
+            .build();
+        let schema = batch.schema();
+        let data_size = write_parquet_batches(
+            Arc::clone(&store),
+            "test.parquet",
+            vec![batch],
+            Some(props),
+        )
+        .await;
+        let file = PartitionedFile::new("test.parquet".to_string(), data_size as u64);
+
+        // predicate: a > 90 -- page index prunes 9 of 10 pages
+        let predicate = logical2physical(&col("a").gt(lit(90i32)), &schema);
+
+        let make_morselizer = || {
+            ParquetMorselizerBuilder::new()
+                .with_store(Arc::clone(&store))
+                .with_schema(Arc::clone(&schema))
+                .with_predicate(Arc::clone(&predicate))
+                .with_enable_page_index(true)
+                .with_parquet_file_reader_factory(Arc::new(
+                    CachedParquetFileReaderFactory::new(
+                        Arc::clone(&store),
+                        Arc::clone(&metadata_cache),
+                    ),
+                ))
+                // disable pushdown and row-group pruning so the only pruning
+                // path is the page index served through the cache/provider
+                .with_pushdown_filters(false)
+                .with_row_group_stats_pruning(false)
+                .build()
+        };
+
+        // First scan: decodes the selection, prunes pages, and merges the
+        // entries into the file's metadata-cache entry.
+        let (_, rows) = count_batches_and_rows(
+            open_file(&make_morselizer(), file.clone()).await.unwrap(),
+        )
+        .await;
+        assert_eq!(rows, 10, "page index should prune 9 of 10 pages");
+
+        let scoped_entry = |key: &PageIndexKey| {
+            let entry = metadata_cache
+                .get(&Path::from("test.parquet"))
+                .expect("metadata cache should contain the file");
+            let cached_parquet = entry
+                .file_metadata
+                .as_any()
+                .downcast_ref::<CachedParquetMetaData>()
+                .expect("entry should be CachedParquetMetaData")
+                .page_indexes_for(
+                    &PageIndexSelection::new()
+                        .with_column_index(*key)
+                        .with_offset_index(*key),
+                );
+            (
+                cached_parquet.column_index(key).map(Arc::clone),
+                cached_parquet.offset_index(key).map(Arc::clone),
+            )
+        };
+
+        // The entry holds the scan's selection (predicate leaf 0, row
+        // group 0), while the cached footer itself stays index-free.
+        let key = PageIndexKey::new(0, 0);
+        let (first_column_index, first_offset_index) = scoped_entry(&key);
+        let first_column_index = first_column_index.expect("column index cached");
+        let first_offset_index = first_offset_index.expect("offset index cached");
+        let entry = metadata_cache.get(&Path::from("test.parquet")).unwrap();
+        let footer = entry
+            .file_metadata
+            .as_any()
+            .downcast_ref::<CachedParquetMetaData>()
+            .unwrap()
+            .parquet_metadata();
+        assert!(footer.column_index().is_none(), "footer stays index-free");
+        assert!(footer.offset_index().is_none(), "footer stays index-free");
+
+        // Second scan: same pruning result; the cached entries are reused
+        // as-is (same Arcs), proving nothing was re-decoded or replaced.
+        let (_, rows) =
+            count_batches_and_rows(open_file(&make_morselizer(), file).await.unwrap())
+                .await;
+        assert_eq!(rows, 10);
+        let (second_column_index, second_offset_index) = scoped_entry(&key);
+        assert!(Arc::ptr_eq(
+            &first_column_index,
+            &second_column_index.unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &first_offset_index,
+            &second_offset_index.unwrap()
+        ));
     }
 
     #[test]
